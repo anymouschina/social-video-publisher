@@ -258,6 +258,13 @@ test('manifests, skill and .mcp.json pass TapCanvas inspectPlugin, probeMcp and 
   assert.deepEqual(installed.problems, []);
   assert.deepEqual(installed.mcpServers, ['social_pub']);
 
+  // Also verify probeMcp against the installed copy under tmpData (which sits behind
+  // macOS /var -> /private/var symlink, catching any non-realpath isMain bugs!)
+  const installedInspect = inspectPlugin(manager.installedDir(installed.name), { requireFormats: ['claude', 'codex'] });
+  const installedProbe = await probeMcp(installedInspect.mcpServers.social_pub, { timeoutMs: 10_000 });
+  assert.equal(installedProbe.ok, true, installedProbe.error || installedProbe.stderr);
+  assert.equal(installedProbe.tools.length, 8);
+
   const claudeTurn = manager.forTurn('claude');
   assert.equal(claudeTurn.plugins.length, 1);
   assert.deepEqual(claudeTurn.names, ['social-video-publisher@0.1.0']);
