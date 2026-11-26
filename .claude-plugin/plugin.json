@@ -1,5 +1,5 @@
 {
   "name": "social-video-publisher",
-  "version": "0.2.0",
-  "description": "一条视频多平台适配并发布或存草稿至小红书、抖音、推特（X）与 B 站；基于本机真实 Chrome CDP，零第三方依赖，默认存草稿且公开发布前强制人工确认。"
+  "version": "0.3.0",
+  "description": "一条视频多平台适配并发布或存草稿至小红书、抖音、推特（X）与 B 站；优先通过 BrowserSkill (bsk) 复用本机已登录真实浏览器并支持专用 Chrome CDP 兜底，零第三方依赖，默认存草稿且公开发布前强制人工确认。"
 }

@@ -12,7 +12,8 @@ import {
   clampWaitSeconds,
   redactSensitiveText,
 } from './constants.mjs';
-import { BrowserSession, parseCookieFile } from './cdp.mjs';
+import { parseCookieFile } from './cdp.mjs';
+import { openBrowserSession } from './transport.mjs';
 import { probeMediaFile } from './media-probe.mjs';
 import { LocalStorage } from './storage.mjs';
 import { PublishJobRunner } from './job-runner.mjs';
@@ -23,6 +24,36 @@ import {
 } from './adapters/index.mjs';
 
 const PLATFORM_ENUM = ['xiaohongshu', 'douyin', 'x', 'bilibili'];
+const BACKEND_ENUM = ['auto', 'bsk', 'cdp'];
+
+function normalizeBackend(raw) {
+  const val = String(raw || 'auto').trim().toLowerCase();
+  return BACKEND_ENUM.includes(val) ? val : null;
+}
+
+function resolveTransportMeta(session) {
+  if (!session || typeof session !== 'object') return null;
+  if (session.transportMeta && typeof session.transportMeta === 'object') {
+    return { ...session.transportMeta };
+  }
+  const backend = session.backend || (session.source === 'bsk' ? 'bsk' : 'cdp');
+  return {
+    backend,
+    source: session.source || backend,
+    ...(session.browserInstanceId ? { browserInstanceId: session.browserInstanceId } : {}),
+    ...(session.browserLabel ? { browserLabel: session.browserLabel } : {}),
+    ...(session.sessionId ? { sessionId: session.sessionId } : {}),
+    ...(session.cdpUrl ? { cdpUrl: session.cdpUrl } : {}),
+    ...(session.profileDir !== undefined ? { profileDir: session.profileDir || null } : {}),
+  };
+}
+
+function isBskSession(session) {
+  if (!session || typeof session !== 'object') return false;
+  return session.backend === 'bsk'
+    || session.transportMeta?.backend === 'bsk'
+    || session.source === 'bsk';
+}
 
 export const TOOLS = [
   {
@@ -35,7 +66,7 @@ export const TOOLS = [
   },
   {
     name: 'check_accounts',
-    description: '只读检查本机 Chrome（复用 TapCanvas CDP 或独立持久化配置目录）中各平台创作者中心的登录状态。不会输出明文 Cookie。',
+    description: '只读检查本机已登录真实 Chrome（优先通过 BrowserSkill bsk 复用现有浏览器，不可用时自动回退至 Chrome CDP 持久化配置目录）中各平台创作者中心的登录状态。不会输出明文 Cookie。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -44,25 +75,34 @@ export const TOOLS = [
           items: { type: 'string' },
           description: '可选：待检查平台列表（如 ["xiaohongshu", "douyin", "x", "bilibili"]，也支持别名 xhs/dy/twitter/b站）；省略时检查全部支持平台。',
         },
+        backend: {
+          type: 'string',
+          enum: ['auto', 'bsk', 'cdp'],
+          description: '可选：浏览器传输后端，默认 "auto"（优先复用 BrowserSkill bsk 已登录真实浏览器，不可用时自动回退 Chrome CDP）；传 "bsk" 强制走 bsk，传 "cdp" 强制走 CDP。',
+        },
+        browserId: {
+          type: 'string',
+          description: '可选：指定 BrowserSkill (bsk) 已连接的浏览器 instance_id（省略时按 BSK_BROWSER_ID / SOCIAL_PUB_BSK_BROWSER 或首个可用浏览器自动选择）。',
+        },
         cookieFiles: {
           type: 'object',
           additionalProperties: { type: 'string' },
-          description: '可选：按平台提供的 0600 Cookie 文件路径映射。注意：抖音、小红书、X 存在设备/密钥绑定（bd_ticket_guard / cf_clearance），默认会拒绝跨配置注入以防风控踢出，推荐直接用 open_login 在持久化 Chrome 内原生登录一次。',
+          description: '可选：按平台提供的 0600 Cookie 文件路径映射。通过 bsk 复用真实浏览器时会自动跳过注入；CDP 模式下抖音、小红书、X 默认拒绝跨配置注入以防风控踢出，推荐用 open_login 原生登录。',
         },
         allowUnsafeCookieInjection: {
           type: 'boolean',
-          description: '可选（默认 false，不建议开启）：仅在明确知晓跨配置 Cookie 移植可能触发抖音/小红书/X 风控下线时显式传 true 才允许注入；即便开启，若持久化 Chrome 已登录也绝不重复覆盖。',
+          description: '可选（默认 false，不建议开启）：仅在 CDP 模式且明确知晓跨配置 Cookie 移植可能触发抖音/小红书/X 风控下线时显式传 true 才允许注入；若已登录或使用 bsk 真实浏览器则绝不覆盖。',
         },
         cdpUrl: {
           type: 'string',
-          description: '可选：覆盖 TAPCANVAS_BROWSER_CDP 调试地址。',
+          description: '可选：显式指定 Chrome CDP 调试地址（传入后直接走 CDP 后端并覆盖 TAPCANVAS_BROWSER_CDP）。',
         },
       },
     },
   },
   {
     name: 'open_login',
-    description: '在可见的真实 Chrome 窗口中打开指定平台创作者登录页，供用户本人扫码或短信登录并自动保存登录态到持久化配置目录。',
+    description: '在可见的真实 Chrome 窗口（优先通过 BrowserSkill bsk 前台 Agent 窗口，不可用时回退至持久化 Chrome CDP）中打开指定平台创作者登录页，供用户本人扫码或短信原生登录。',
     inputSchema: {
       type: 'object',
       required: ['platform'],
@@ -71,9 +111,18 @@ export const TOOLS = [
           type: 'string',
           description: '目标平台（xiaohongshu / douyin / x / bilibili，支持别名 xhs / dy / twitter / b站）。',
         },
+        backend: {
+          type: 'string',
+          enum: ['auto', 'bsk', 'cdp'],
+          description: '可选：浏览器传输后端，默认 "auto"（优先通过 BrowserSkill bsk 打开前台 Agent 窗口，不可用时回退 Chrome CDP）。',
+        },
+        browserId: {
+          type: 'string',
+          description: '可选：指定 BrowserSkill (bsk) 已连接的浏览器 instance_id。',
+        },
         cdpUrl: {
           type: 'string',
-          description: '可选：覆盖 TAPCANVAS_BROWSER_CDP 调试地址。',
+          description: '可选：显式指定 Chrome CDP 调试地址（传入后直接走 CDP 后端并覆盖 TAPCANVAS_BROWSER_CDP）。',
         },
       },
     },
@@ -188,18 +237,27 @@ export const TOOLS = [
           type: 'boolean',
           description: '仅当 mode="publish" 且已获得用户明确人工批准（如 mcp__tapcanvas__approval 批准）时传 true。',
         },
+        backend: {
+          type: 'string',
+          enum: ['auto', 'bsk', 'cdp'],
+          description: '可选：浏览器传输后端，默认 "auto"（优先复用 BrowserSkill bsk 已登录真实浏览器，不可用时自动回退 Chrome CDP）；传 "bsk" 强制走 bsk，传 "cdp" 强制走 CDP。',
+        },
+        browserId: {
+          type: 'string',
+          description: '可选：指定 BrowserSkill (bsk) 已连接的浏览器 instance_id。',
+        },
         cookieFiles: {
           type: 'object',
           additionalProperties: { type: 'string' },
-          description: '可选：按平台提供的 0600 Cookie 文件路径映射（设备绑定平台 douyin/xiaohongshu/x 默认拒绝跨配置注入，推荐使用 open_login 原生登录）。',
+          description: '可选：按平台提供的 0600 Cookie 文件路径映射（bsk 真实浏览器下自动跳过注入；CDP 模式下设备绑定平台 douyin/xiaohongshu/x 默认拒绝跨配置注入）。',
         },
         allowUnsafeCookieInjection: {
           type: 'boolean',
-          description: '可选（默认 false，不建议开启）：仅在明确知晓风险时传 true 才允许对 douyin/xiaohongshu/x 注入 cookieFiles；若持久化 Chrome 已登录仍会跳过覆盖。',
+          description: '可选（默认 false，不建议开启）：仅在 CDP 模式且明确知晓风险时传 true 才允许对 douyin/xiaohongshu/x 注入 cookieFiles；若已登录或使用 bsk 真实浏览器仍会跳过覆盖。',
         },
         cdpUrl: {
           type: 'string',
-          description: '可选：覆盖 TAPCANVAS_BROWSER_CDP 调试地址。',
+          description: '可选：显式指定 Chrome CDP 调试地址（传入后直接走 CDP 后端并覆盖 TAPCANVAS_BROWSER_CDP）。',
         },
         waitSeconds: {
           type: 'integer',
@@ -309,7 +367,7 @@ export function createPublisherService(deps = {}) {
   const lookupAdapter = deps.getAdapter || getAdapter;
   const listSpecs = deps.listPlatformSpecs || listPlatformSpecs;
   const probeMedia = deps.probeMediaFile || ((file, opts) => probeMediaFile(file, { ...opts, env }));
-  const sessionFactory = deps.sessionFactory || ((opts) => BrowserSession.connect({ ...opts, env }));
+  const sessionFactory = deps.sessionFactory || ((opts) => openBrowserSession({ ...opts, env }));
 
   const runner = deps.runner || new PublishJobRunner({
     storage,
@@ -338,6 +396,14 @@ export function createPublisherService(deps = {}) {
       ? args.platforms
       : PLATFORM_ENUM;
 
+    const backend = normalizeBackend(args.backend);
+    if (!backend) {
+      return {
+        ok: false,
+        error: `不支持的浏览器后端：${args.backend}（仅支持 auto、bsk 或 cdp）`,
+      };
+    }
+
     const resolvedIds = [];
     const unknown = [];
     for (const raw of requested) {
@@ -356,7 +422,14 @@ export function createPublisherService(deps = {}) {
     const allowUnsafeCookieInjection = args.allowUnsafeCookieInjection === true;
     let session = null;
     try {
-      session = await sessionFactory({ cdpUrl: args.cdpUrl || '' });
+      session = await sessionFactory({
+        backend,
+        browserId: args.browserId || '',
+        cdpUrl: args.cdpUrl || '',
+        focus: false,
+      });
+      const bskNative = isBskSession(session);
+      const transport = resolveTransportMeta(session);
       const accounts = [];
       for (const platformId of resolvedIds) {
         const adapter = lookupAdapter(platformId);
@@ -370,7 +443,12 @@ export function createPublisherService(deps = {}) {
           let cookieInjectionSkipped = null;
           let result = null;
 
-          if (cookiePath && DEVICE_BOUND_COOKIE_PLATFORMS.has(platformId) && !allowUnsafeCookieInjection) {
+          if (bskNative) {
+            if (cookiePath) {
+              cookieInjectionSkipped = 'bsk_native_browser';
+            }
+            result = await adapter.checkAuth(page);
+          } else if (cookiePath && DEVICE_BOUND_COOKIE_PLATFORMS.has(platformId) && !allowUnsafeCookieInjection) {
             // Refuse cross-profile cookie transplant for device-bound platforms; inspect persistent profile natively.
             cookieInjectionBlocked = true;
             result = await adapter.checkAuth(page);
@@ -400,6 +478,9 @@ export function createPublisherService(deps = {}) {
           } else if (cookieInjectionBlocked && loggedIn) {
             const note = `持久化 Chrome 配置目录已原生登录，已自动忽略跨配置 cookieFiles 注入。`;
             message = message ? `${note} ${message}` : note;
+          } else if (cookieInjectionSkipped === 'bsk_native_browser') {
+            const note = `已通过 BrowserSkill (bsk) 直接复用本机真实浏览器原生会话与设备密钥，已自动跳过 cookieFiles 注入。`;
+            message = message ? `${note} ${message}` : note;
           }
 
           accounts.push({
@@ -412,6 +493,9 @@ export function createPublisherService(deps = {}) {
             loginUrl: adapter.spec.loginUrl,
             ...(cookieInjectionBlocked ? { cookieInjectionBlocked: true } : {}),
             ...(cookieInjectionSkipped ? { cookieInjectionSkipped } : {}),
+            ...(cookieInjectionSkipped === 'bsk_native_browser'
+              ? { diagnostics: { cookieInjectionSkipped: 'bsk_native_browser' } }
+              : {}),
             message,
           });
         } catch (error) {
@@ -432,8 +516,11 @@ export function createPublisherService(deps = {}) {
       }
       return {
         ok: true,
+        transport,
         browser: {
-          source: session.source || 'cdp',
+          backend: transport?.backend || 'cdp',
+          source: transport?.source || session.source || 'cdp',
+          browserLabel: transport?.browserLabel || null,
           profileDir: session.profileDir || null,
         },
         accounts,
@@ -458,22 +545,40 @@ export function createPublisherService(deps = {}) {
         error: `不支持的平台：${args.platform || '(空)'}（支持：${PLATFORM_ENUM.join(', ')}）`,
       };
     }
+    const backend = normalizeBackend(args.backend);
+    if (!backend) {
+      return {
+        ok: false,
+        platform: platformId,
+        error: `不支持的浏览器后端：${args.backend}（仅支持 auto、bsk 或 cdp）`,
+      };
+    }
     const adapter = lookupAdapter(platformId);
     let session = null;
     try {
-      session = await sessionFactory({ cdpUrl: args.cdpUrl || '' });
+      session = await sessionFactory({
+        backend,
+        browserId: args.browserId || '',
+        cdpUrl: args.cdpUrl || '',
+        focus: true,
+      });
+      const transport = resolveTransportMeta(session);
       const page = await session.newPage();
       if (typeof session.keepTargetOpen === 'function') {
         session.keepTargetOpen(page);
       }
       const res = await adapter.openLogin(page);
+      const defaultMsg = transport?.backend === 'bsk'
+        ? `已通过 BrowserSkill (bsk) 在本机真实浏览器（${transport.browserLabel || transport.browserInstanceId || 'Chrome'}）的 Agent 窗口打开 ${adapter.spec.name} 登录页，请完成扫码/短信登录后再调用 check_accounts 复查。`
+        : `已在可见 Chrome 窗口打开 ${adapter.spec.name} 登录页，请完成扫码/短信登录后再调用 check_accounts 复查。`;
       return {
         ok: true,
         platform: platformId,
         name: adapter.spec.name,
         loginUrl: res?.url || adapter.spec.loginUrl,
+        transport,
         profileDir: session.profileDir || null,
-        message: res?.message || `已在可见 Chrome 窗口打开 ${adapter.spec.name} 登录页，请完成扫码/短信登录后再调用 check_accounts 复查。`,
+        message: res?.message || defaultMsg,
       };
     } catch (error) {
       return {
@@ -483,8 +588,8 @@ export function createPublisherService(deps = {}) {
       };
     } finally {
       if (session && typeof session.close === 'function') {
-        // Keep the login tab open so the user can interact with it!
-        try { await session.close({ closeOwnedTabs: false }); } catch { /* ignore */ }
+        // Keep the login tab/Agent Window open via keepTargetOpen(page), while cleaning up any non-kept tabs/empty session.
+        try { await session.close({ closeOwnedTabs: true }); } catch { /* ignore */ }
       }
     }
   }
@@ -675,9 +780,16 @@ export function createPublisherService(deps = {}) {
       };
     }
 
+    const backend = normalizeBackend(args.backend);
+    if (!backend) {
+      return { ok: false, error: `不支持的浏览器后端：${args.backend}（仅支持 auto、bsk 或 cdp）` };
+    }
+
     return runner.startJob(plan, {
       mode: effectiveMode,
       confirmed: args.confirmed === true,
+      backend,
+      browserId: args.browserId || '',
       cookieFiles: args.cookieFiles,
       allowUnsafeCookieInjection: args.allowUnsafeCookieInjection === true,
       cdpUrl: args.cdpUrl,

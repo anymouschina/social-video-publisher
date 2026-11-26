@@ -224,6 +224,26 @@ function checkBilibiliGuard(page, { stage = 'flow', inFlow = false } = {}) {
   });
 }
 
+async function hasTopDocumentInput(page, selectors) {
+  if (!page || typeof page.evaluate !== 'function') return null;
+  try {
+    const found = await page.evaluate((sels) => {
+      if (typeof document === 'undefined' || !Array.isArray(sels)) return false;
+      for (const sel of sels) {
+        try {
+          if (document.querySelector(sel)) return true;
+        } catch (_) {
+          // Ignore non-CSS pseudo-selectors.
+        }
+      }
+      return false;
+    }, selectors);
+    return typeof found === 'boolean' ? found : null;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveUploadFrameUrl(page) {
   if (!page || typeof page.evaluate !== 'function') return null;
   try {
@@ -363,9 +383,13 @@ export async function publishVideo(page, ctx) {
 
     let currentUrl = postNavGuard.url || (await page.url()) || '';
 
-    // Handle Bilibili's iframe-hosted upload shell if file input isn't on top document
-    const directInput = await safeQueryAny(page, VIDEO_INPUT_SELECTORS);
-    if (!directInput.found) {
+    // Handle Bilibili's iframe-hosted upload shell whenever file input isn't on the top document.
+    // Note: queryAny walks same-origin iframes, so we check top `document` explicitly first
+    // so BSK (which operates on main-document CSS selectors) always navigates into `videoUpload`.
+    const topDocInput = await hasTopDocumentInput(page, VIDEO_INPUT_SELECTORS);
+    const hasTopInput = topDocInput === true
+      || (topDocInput === null && (await safeQueryAny(page, VIDEO_INPUT_SELECTORS)).found);
+    if (!hasTopInput) {
       const frameUrl = await resolveUploadFrameUrl(page);
       if (frameUrl && frameUrl !== currentUrl) {
         diagnostics.steps.push({ step: 'enter_upload_frame', frameUrl });

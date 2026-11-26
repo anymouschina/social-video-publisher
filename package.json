@@ -1,7 +1,7 @@
 {
   "name": "social-video-publisher",
-  "version": "0.2.0",
-  "description": "Zero-dependency TapCanvas / Claude Code / Codex plugin for multi-platform video publishing (Xiaohongshu, Douyin, X/Twitter, Bilibili) over real Chrome CDP.",
+  "version": "0.3.0",
+  "description": "Zero-dependency TapCanvas / Claude Code / Codex plugin for multi-platform video publishing (Xiaohongshu, Douyin, X/Twitter, Bilibili), reusing existing logged-in Chrome via BrowserSkill (bsk) with dedicated Chrome CDP fallback.",
   "type": "module",
   "license": "MIT",
   "engines": {

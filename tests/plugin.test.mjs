@@ -34,6 +34,18 @@ import {
   discoverCdpCandidates,
   parseCookieFile,
 } from '../src/cdp.mjs';
+import {
+  BUILD_UNIQUE_CSS_PATH_SOURCE,
+  BskError,
+  BskPage,
+  BskSession,
+  probeBskAvailable,
+  runBsk,
+} from '../src/bsk.mjs';
+import {
+  openBrowserSession,
+  probeBrowserTransport,
+} from '../src/transport.mjs';
 import { shouldKeepTabOpen } from '../src/job-runner.mjs';
 import { probeMediaFile } from '../src/media-probe.mjs';
 import { LocalStorage } from '../src/storage.mjs';
@@ -121,6 +133,13 @@ function createMockPage(config = {}) {
       // 4. resolveUploadFrameUrl on Bilibili
       if (src.includes('iframe[name="videoUpload"]')) {
         return config.iframeSrc || null;
+      }
+      // 4b. hasTopDocumentInput on Bilibili
+      if (src.includes('document.querySelector(sel)') && Array.isArray(args[0])) {
+        if (typeof config.topDocHasInput === 'function') {
+          return config.topDocHasInput(state, args[0]);
+        }
+        return config.topDocHasInput !== undefined ? Boolean(config.topDocHasInput) : null;
       }
       // 5. Read-only clickWithTextFallback text matcher (zero data-svp-click DOM mutation!)
       if (src.includes('INTERACTIVE_SELECTOR') && src.includes('FALLBACK_SELECTOR')) {
@@ -236,10 +255,13 @@ function createTempMedia(t) {
 
 test('manifests, skill and .mcp.json pass TapCanvas inspectPlugin, probeMcp and AgentPlugins install/forTurn', async (t) => {
   // Check standalone invariants first (always runs even outside TapCanvas-pro workspace)
+  const pkgManifest = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, 'package.json'), 'utf8'));
   const claudeManifest = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, '.claude-plugin', 'plugin.json'), 'utf8'));
   const codexManifest = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, '.codex-plugin', 'plugin.json'), 'utf8'));
   const mcpConfig = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, '.mcp.json'), 'utf8'));
 
+  assert.equal(PLUGIN_VERSION, '0.3.0');
+  assert.equal(pkgManifest.version, '0.3.0');
   assert.equal(claudeManifest.name, PLUGIN_NAME);
   assert.equal(codexManifest.name, PLUGIN_NAME);
   assert.equal(claudeManifest.version, PLUGIN_VERSION);
@@ -256,6 +278,11 @@ test('manifests, skill and .mcp.json pass TapCanvas inspectPlugin, probeMcp and 
     const fullName = `mcp__social_pub__${tool.name}`;
     assert.ok(fullName.length <= 64, `Tool name too long (${fullName.length}): ${fullName}`);
   }
+  for (const toolName of ['check_accounts', 'open_login', 'start_publish_job']) {
+    const schema = TOOLS.find((t) => t.name === toolName)?.inputSchema?.properties;
+    assert.deepEqual(schema?.backend?.enum, ['auto', 'bsk', 'cdp'], `${toolName} must expose backend enum`);
+    assert.equal(schema?.browserId?.type, 'string', `${toolName} must expose browserId string`);
+  }
 
   const agentPluginsPath = findTapCanvasAgentPlugins();
   if (!agentPluginsPath) return;
@@ -265,7 +292,7 @@ test('manifests, skill and .mcp.json pass TapCanvas inspectPlugin, probeMcp and 
   const info = inspectPlugin(PLUGIN_ROOT, { requireFormats: ['claude', 'codex'] });
   assert.deepEqual(info.problems, []);
   assert.equal(info.name, 'social-video-publisher');
-  assert.equal(info.version, '0.2.0');
+  assert.equal(info.version, '0.3.0');
   assert.equal(info.logoUrl, codexManifest.interface.logo);
   assert.equal(info.skills.length, 1);
   assert.equal(info.skills[0].name, 'social-video-publish');
@@ -306,7 +333,7 @@ test('manifests, skill and .mcp.json pass TapCanvas inspectPlugin, probeMcp and 
 
   const claudeTurn = manager.forTurn('claude');
   assert.equal(claudeTurn.plugins.length, 1);
-  assert.deepEqual(claudeTurn.names, ['social-video-publisher@0.2.0']);
+  assert.deepEqual(claudeTurn.names, ['social-video-publisher@0.3.0']);
 
   const codexTurn = manager.forTurn('codex');
   assert.ok(codexTurn.mcpServers.social_pub);
@@ -381,11 +408,13 @@ test('stdio JSON-RPC server handles initialize, tools/list, list_platforms, prep
   const [r1, r2, r3, r4] = await Promise.all([waitForId(1), waitForId(2), waitForId(3), waitForId(4)]);
 
   assert.equal(r1.result.serverInfo.name, 'social-video-publisher');
+  assert.equal(r1.result.serverInfo.version, '0.3.0');
   assert.equal(r1.result.protocolVersion, '2025-06-18');
   assert.equal(r2.result.tools.length, 8);
 
   const listed = JSON.parse(r3.result.content[0].text);
   assert.equal(listed.ok, true);
+  assert.equal(listed.plugin.version, '0.3.0');
   assert.equal(listed.platforms.length, 4);
   assert.equal(listed.safetyDefaults.defaultMode, 'draft');
   assert.equal(listed.safetyDefaults.publishRequiresConfirmedTrue, true);
@@ -1845,4 +1874,797 @@ test('guard false-positive regression: Douyin normal safety widget text and user
   });
   assert.equal(modalCheck.blocked, true);
   assert.equal(modalCheck.status, 'needs_verification');
+});
+
+test('BskSession & BskPage: probeBskAvailable, timeout grace, resync, operation_settling, evaluate ok:false, setFiles reveal+restore, fillText, typeTag, clickPoint, keepTargetOpen', async (t) => {
+  const { tmpDir, videoPath } = createTempMedia(t);
+  const fakeBin = '/mock/bin/bsk';
+
+  // Helper to build a BSK CLI failure matching child_process.execFile error shape
+  function makeCliError(exitCode, payload) {
+    const err = new Error(payload?.error || payload?.reason || `bsk exit ${exitCode}`);
+    err.code = exitCode;
+    err.stdout = JSON.stringify(payload);
+    err.stderr = '';
+    return err;
+  }
+
+  // 1. probeBskAvailable: priority explicit browserId -> BSK_BROWSER_ID -> SOCIAL_PUB_BSK_BROWSER -> first healthy
+  const browserList = [
+    { instance_id: 'bad-unresp', label: '卡死浏览器', browser_name: 'Chrome', unresponsive: true, version_skew: false },
+    { instance_id: 'bad-skew', label: '旧版浏览器', browser_name: 'Chrome', unresponsive: false, version_skew: true },
+    { instance_id: 'ok-primary', label: '主要浏览器', browser_name: 'Chrome', browser_version: '136', extension_version: '0.5.0', unresponsive: false, version_skew: false },
+    { instance_id: 'ok-work', label: '工作浏览器', browser_name: 'Chrome', browser_version: '136', extension_version: '0.5.0', unresponsive: false, version_skew: false },
+  ];
+  const probeCalls = [];
+  const probeExec = async (bin, args, opts) => {
+    probeCalls.push({ bin, args, opts });
+    return { stdout: JSON.stringify(browserList), stderr: '' };
+  };
+
+  const pDefault = await probeBskAvailable({ bskBin: fakeBin, env: {}, execFileImpl: probeExec });
+  assert.equal(pDefault.available, true);
+  assert.equal(pDefault.browser.instance_id, 'ok-primary');
+  assert.equal(pDefault.browser.label, '主要浏览器');
+  // `browsers` subcommand must NOT receive `--timeout`, and Node child timeout must be (8 + 5) * 1000 = 13000ms
+  assert.equal(probeCalls[0].args.includes('--timeout'), false, 'bsk browsers must not receive --timeout');
+  assert.equal(probeCalls[0].opts.timeout, 13_000, 'Node execFile timeout must be (bskTimeoutSec + 5) * 1000');
+
+  const pEnvBsk = await probeBskAvailable({ bskBin: fakeBin, env: { BSK_BROWSER_ID: 'ok-work', SOCIAL_PUB_BSK_BROWSER: 'ok-primary' }, execFileImpl: probeExec });
+  assert.equal(pEnvBsk.available, true);
+  assert.equal(pEnvBsk.browser.instance_id, 'ok-work');
+
+  const pExplicit = await probeBskAvailable({ browserId: 'ok-primary', bskBin: fakeBin, env: { BSK_BROWSER_ID: 'ok-work' }, execFileImpl: probeExec });
+  assert.equal(pExplicit.available, true);
+  assert.equal(pExplicit.browser.instance_id, 'ok-primary');
+
+  const pMissing = await probeBskAvailable({ browserId: 'nope', bskBin: fakeBin, env: {}, execFileImpl: probeExec });
+  assert.equal(pMissing.available, false);
+  assert.equal(pMissing.reason, 'requested_browser_not_found');
+
+  const pUnavail = await probeBskAvailable({ bskBin: fakeBin, env: {}, execFileImpl: async () => ({ stdout: '[]', stderr: '' }) });
+  assert.equal(pUnavail.available, false);
+  assert.equal(pUnavail.reason, 'no_connected_browsers');
+
+  // 2. Full BskSession + BskPage stateful CLI mock
+  const calls = [];
+  let syncSeq = 0;
+  let nextTabId = 200;
+  let failEvalWithSyncOnce = true;
+  let failClickWithInvalidCtxOnce = true;
+  let failHoverWithSettlingOnce = true;
+  let evalReturnExceptionOnce = false;
+  let hiddenStyleHistory = [];
+  let setFilesMode = 'visible'; // 'visible' | 'hidden_ok' | 'hidden_fail'
+  let fillTargetTag = 'div';
+  let fillTargetContentEditable = true;
+  let clickPointTargetPath = '#submit-btn';
+
+  const mockExec = async (bin, args, opts) => {
+    calls.push({ bin, args: [...args], opts });
+    const cmd = args[0];
+    const sub = args[1];
+
+    if (cmd === 'browsers') {
+      return { stdout: JSON.stringify(browserList), stderr: '' };
+    }
+    if (cmd === 'session' && sub === 'start') {
+      assert.equal(args.includes('--timeout'), false, 'session start must not pass --timeout');
+      return {
+        stdout: JSON.stringify({
+          session_id: 'bsk-sess-1',
+          agent_window_id: 9001,
+          browser_instance_id: 'ok-primary',
+        }),
+        stderr: '',
+      };
+    }
+    if (cmd === 'session' && sub === 'stop') {
+      return { stdout: JSON.stringify({ stopped: [args[2]], failed: [] }), stderr: '' };
+    }
+    if (cmd === 'tab' && sub === 'list') {
+      return {
+        stdout: JSON.stringify({
+          tabs: [{ tab_id: 101, url: 'about:blank', title: '', window_id: 9001, active: true, scope: 'agent' }],
+        }),
+        stderr: '',
+      };
+    }
+    if (cmd === 'tab' && sub === 'create') {
+      const id = nextTabId++;
+      return { stdout: JSON.stringify({ tab_id: id, window_id: 9001, url: 'about:blank' }), stderr: '' };
+    }
+    if (cmd === 'tab' && sub === 'close') {
+      return { stdout: JSON.stringify({ tab_id: Number(args[2]) }), stderr: '' };
+    }
+    if (cmd === 'sync') {
+      assert.equal(args.includes('--timeout'), false, 'sync must not pass --timeout');
+      syncSeq += 1;
+      return {
+        stdout: JSON.stringify({
+          context_id: `ctx_${syncSeq}`,
+          observation_id: `obs_${syncSeq}`,
+          session_id: 'bsk-sess-1',
+          tab_id: Number(args[args.indexOf('--tab-id') + 1]),
+          url: '',
+          title: '',
+        }),
+        stderr: '',
+      };
+    }
+    if (cmd === 'navigate') {
+      assert.ok(args.includes('--timeout'), 'navigate must pass --timeout');
+      return {
+        stdout: JSON.stringify({
+          tab_id: Number(args[args.indexOf('--tab-id') + 1]),
+          url: args[1],
+          final_url: args[1],
+          reached: true,
+        }),
+        stderr: '',
+      };
+    }
+    if (cmd === 'evaluate') {
+      assert.ok(args.includes('--timeout'), 'evaluate must pass --timeout');
+      assert.equal(opts.timeout, 35_000, 'evaluate Node timeout must be (30 + 5) * 1000');
+      const expr = args.includes('--') ? args[args.indexOf('--') + 1] : args[1];
+
+      if (failEvalWithSyncOnce) {
+        failEvalWithSyncOnce = false;
+        throw makeCliError(1, { reason: 'cooperation_sync_required', error: 'sync required' });
+      }
+      if (evalReturnExceptionOnce) {
+        evalReturnExceptionOnce = false;
+        // CRITICAL: exit 0 with { ok: false } MUST still throw in BskPage.evaluate!
+        return {
+          stdout: JSON.stringify({
+            ok: false,
+            tab_id: 101,
+            error: { text: 'ReferenceError: boom is not defined', line: 1, column: 5 },
+            verified: false,
+          }),
+          stderr: '',
+        };
+      }
+      if (expr.includes('window.innerWidth')) {
+        return { stdout: JSON.stringify({ ok: true, value: { width: 1440, height: 900, scrollY: 0 } }), stderr: '' };
+      }
+      if (expr.includes('window.location.href')) {
+        return { stdout: JSON.stringify({ ok: true, value: 'https://creator.douyin.com/creator-micro/content/upload' }), stderr: '' };
+      }
+      if (expr.includes('document.title')) {
+        return { stdout: JSON.stringify({ ok: true, value: '抖音创作者中心' }), stderr: '' };
+      }
+      // setFiles probe
+      if (expr.includes('labelCssPath')) {
+        if (setFilesMode === 'visible') {
+          return {
+            stdout: JSON.stringify({
+              ok: true,
+              value: { found: true, selector: 'input[type="file"]', cssPath: '#visible-upload', hasBox: true, labelCssPath: null },
+            }),
+            stderr: '',
+          };
+        }
+        return {
+          stdout: JSON.stringify({
+            ok: true,
+            value: { found: true, selector: 'input[type="file"]', cssPath: '#hidden-upload', hasBox: false, labelCssPath: null },
+          }),
+          stderr: '',
+        };
+      }
+      // setFiles temporary reveal
+      if (expr.includes("el.setAttribute('style', 'opacity:0;width:1px;height:1px;display:block;position:fixed;left:0;top:0;pointer-events:none')")) {
+        hiddenStyleHistory.push({ op: 'reveal' });
+        return { stdout: JSON.stringify({ ok: true, value: { hadStyle: true, origStyle: 'display:none' } }), stderr: '' };
+      }
+      // setFiles finally restore
+      if (expr.includes("el.removeAttribute('style')") && expr.includes("el.setAttribute('style', origStyle")) {
+        hiddenStyleHistory.push({ op: 'restore', expr });
+        return { stdout: JSON.stringify({ ok: true, value: null }), stderr: '' };
+      }
+      // clickPoint elementFromPoint lookup
+      if (expr.includes('document.elementFromPoint(px, py)')) {
+        return {
+          stdout: JSON.stringify({
+            ok: true,
+            value: { found: true, cssPath: clickPointTargetPath },
+          }),
+          stderr: '',
+        };
+      }
+      // _resolveElementTarget
+      if (expr.includes('__svBuildUniqueCssPath(el)')) {
+        return {
+          stdout: JSON.stringify({
+            ok: true,
+            value: {
+              selector: '.editor',
+              cssPath: fillTargetTag === 'input' ? '#title-input' : '#ce-editor',
+              visible: true,
+              disabled: false,
+              left: 300,
+              top: 260,
+              x: 300,
+              y: 260,
+              width: 320,
+              height: 60,
+              tagName: fillTargetTag,
+              isContentEditable: fillTargetContentEditable,
+            },
+          }),
+          stderr: '',
+        };
+      }
+      return { stdout: JSON.stringify({ ok: true, value: null }), stderr: '' };
+    }
+    if (cmd === 'hover') {
+      if (failHoverWithSettlingOnce) {
+        failHoverWithSettlingOnce = false;
+        throw makeCliError(1, { reason: 'operation_settling', retry_after_ms: 150, error: 'settling' });
+      }
+      return { stdout: JSON.stringify({ tab_id: 101, x: 420, y: 290 }), stderr: '' };
+    }
+    if (cmd === 'click') {
+      if (failClickWithInvalidCtxOnce) {
+        failClickWithInvalidCtxOnce = false;
+        throw makeCliError(1, { reason: 'control_context_invalid', error: 'stale context' });
+      }
+      return { stdout: JSON.stringify({ tab_id: 101, x: 420, y: 290 }), stderr: '' };
+    }
+    if (cmd === 'focus') {
+      return { stdout: JSON.stringify({ tab_id: 101, focused: true }), stderr: '' };
+    }
+    if (cmd === 'fill') {
+      return { stdout: JSON.stringify({ tab_id: 101, value_length: 4 }), stderr: '' };
+    }
+    if (cmd === 'press') {
+      return { stdout: JSON.stringify({ tab_id: 101, key: args[1] }), stderr: '' };
+    }
+    if (cmd === 'upload') {
+      if (setFilesMode === 'hidden_fail') {
+        throw makeCliError(1, { reason: 'upload_rejected', error: 'mock upload failure' });
+      }
+      return { stdout: JSON.stringify({ tab_id: 101, file_names: ['demo.mp4'] }), stderr: '' };
+    }
+    if (cmd === 'screenshot') {
+      const outPath = args[args.indexOf('--out') + 1];
+      fs.writeFileSync(outPath, Buffer.from('PNG_BSK'));
+      return { stdout: JSON.stringify({ path: outPath, width: 1440, height: 900, byte_size: 7 }), stderr: '' };
+    }
+    return { stdout: '{}', stderr: '' };
+  };
+
+  // Connect BskSession (normal background session -> --no-focus)
+  const session = await BskSession.connect({
+    bskBin: fakeBin,
+    env: {},
+    execFileImpl: mockExec,
+    fastMode: true,
+    rng: createSeededRng(303),
+  });
+  assert.equal(session.source, 'bsk');
+  assert.equal(session.backend, 'bsk');
+  assert.equal(session.browserInstanceId, 'ok-primary');
+  assert.equal(session.browserLabel, '主要浏览器');
+  const startCall = calls.find((c) => c.args[0] === 'session' && c.args[1] === 'start');
+  assert.ok(startCall.args.includes('--no-focus'));
+
+  // 1st newPage reuses initial about:blank tab (101); 2nd creates a new tab (200)
+  const page1 = await session.newPage();
+  assert.equal(page1.tabId, 101);
+  const page2 = await session.newPage();
+  assert.equal(page2.tabId, 200);
+
+  // evaluate auto-resyncs on cooperation_sync_required and succeeds
+  const syncCountBefore = calls.filter((c) => c.args[0] === 'sync').length;
+  const pageUrl = await page1.url();
+  assert.equal(pageUrl, 'https://creator.douyin.com/creator-micro/content/upload');
+  assert.ok(calls.filter((c) => c.args[0] === 'sync').length > syncCountBefore, 'must resync on cooperation_sync_required');
+
+  // evaluate MUST throw on { ok: false } even when bsk exits 0!
+  evalReturnExceptionOnce = true;
+  await assert.rejects(() => page1.evaluate('boom()'), /ReferenceError: boom is not defined/);
+
+  // clickPoint: zero-size / invalid rect guard
+  await assert.rejects(() => page1.clickPoint(null), /无效或零尺寸矩形/);
+  await assert.rejects(() => page1.clickPoint({ left: 10, top: 20, width: 0, height: 30 }), /无效或零尺寸矩形/);
+  await assert.rejects(() => page1.clickPoint({ x: 10, y: 20, width: 50, height: 0 }), /无效或零尺寸矩形/);
+
+  // clickPoint: uses elementFromPoint -> unique CSS path -> hover (retries operation_settling) + click (resyncs control_context_invalid)
+  const hoverCountBefore = calls.filter((c) => c.args[0] === 'hover').length;
+  const clickCountBefore = calls.filter((c) => c.args[0] === 'click').length;
+  const pt = await page1.clickPoint({ left: 400, top: 260, width: 120, height: 40 });
+  assert.ok(pt.x >= 400 + 120 * 0.22 && pt.x <= 400 + 120 * 0.78);
+  assert.equal(calls.filter((c) => c.args[0] === 'hover').length - hoverCountBefore, 2, 'hover must retry once on operation_settling');
+  assert.equal(calls.filter((c) => c.args[0] === 'click').length - clickCountBefore, 2, 'click must resync & retry once on control_context_invalid');
+
+  // Verify BUILD_UNIQUE_CSS_PATH_SOURCE is strictly read-only and produces valid unique CSS paths
+  {
+    let mutationCount = 0;
+    const targetNode = {
+      nodeType: 1,
+      id: '',
+      tagName: 'BUTTON',
+      setAttribute: () => { mutationCount += 1; },
+    };
+    const siblingBtn = { nodeType: 1, id: '', tagName: 'BUTTON' };
+    const parentDiv = { nodeType: 1, id: 'toolbar', tagName: 'DIV', children: [siblingBtn, targetNode], parentElement: null };
+    targetNode.parentElement = parentDiv;
+    siblingBtn.parentElement = parentDiv;
+    const fakeDoc = {
+      querySelector: (sel) => (sel === '#toolbar > button:nth-of-type(2)' ? targetNode : null),
+      querySelectorAll: (sel) => (sel === '#toolbar' ? [parentDiv] : []),
+    };
+    targetNode.ownerDocument = fakeDoc;
+    parentDiv.ownerDocument = fakeDoc;
+    targetNode.getRootNode = () => fakeDoc;
+    parentDiv.getRootNode = () => fakeDoc;
+    const buildPath = new Function('document', `${BUILD_UNIQUE_CSS_PATH_SOURCE}; return __svBuildUniqueCssPath;`)(fakeDoc);
+    assert.equal(buildPath(targetNode), '#toolbar > button:nth-of-type(2)');
+    assert.equal(mutationCount, 0, 'BUILD_UNIQUE_CSS_PATH_SOURCE must never mutate DOM');
+  }
+
+  // setFiles (a): visible/non-zero box input uploads directly without style reveal
+  setFilesMode = 'visible';
+  hiddenStyleHistory = [];
+  const upVis = await page1.setFiles(['input[type="file"]'], videoPath);
+  assert.equal(upVis.selector, 'input[type="file"]');
+  assert.equal(hiddenStyleHistory.length, 0);
+  const lastUpload = calls.filter((c) => c.args[0] === 'upload').at(-1);
+  assert.ok(lastUpload.args.includes('--selector') && lastUpload.args.includes('#visible-upload'));
+
+  // setFiles (b): hidden display:none input reveals temporarily AND restores exact original style in finally
+  setFilesMode = 'hidden_ok';
+  hiddenStyleHistory = [];
+  await page1.setFiles(['input[type="file"]'], videoPath);
+  assert.deepEqual(hiddenStyleHistory.map((h) => h.op), ['reveal', 'restore']);
+  assert.match(hiddenStyleHistory[1].expr, /display:none/);
+
+  // setFiles (c): hidden input STILL restores original style in finally even when upload throws!
+  setFilesMode = 'hidden_fail';
+  hiddenStyleHistory = [];
+  await assert.rejects(() => page1.setFiles(['input[type="file"]'], videoPath), /mock upload failure/);
+  assert.deepEqual(hiddenStyleHistory.map((h) => h.op), ['reveal', 'restore'], 'finally must restore style even on upload failure');
+
+  // fillText: chunked fill with --no-clear on subsequent chunks
+  fillTargetTag = 'div';
+  fillTargetContentEditable = true;
+  const fillIdxBefore = calls.length;
+  await page1.fillText(['.editor'], 'Hello世界，测试分块输入！', { clear: true });
+  const fillCalls = calls.slice(fillIdxBefore).filter((c) => c.args[0] === 'fill');
+  assert.ok(fillCalls.length >= 3, `expected chunked fill calls, got ${fillCalls.length}`);
+  assert.equal(fillCalls[0].args.includes('--no-clear'), false, 'first chunk must clear when clear=true');
+  assert.ok(fillCalls.slice(1).every((c) => c.args.includes('--no-clear')), 'subsequent chunks must pass --no-clear');
+  const joinedFill = fillCalls.map((c) => {
+    const idx = c.args.indexOf('--value');
+    if (idx !== -1) return c.args[idx + 1];
+    const eq = c.args.find((a) => a.startsWith('--value='));
+    return eq ? eq.slice('--value='.length) : '';
+  }).join('');
+  assert.equal(joinedFill, 'Hello世界，测试分块输入！');
+
+  // fillText on single-line <input> replaces newlines with spaces
+  fillTargetTag = 'input';
+  fillTargetContentEditable = false;
+  const inputFillBefore = calls.length;
+  await page1.fillText(['.editor'], 'Line1\r\nLine2', { clear: true, humanJitter: false });
+  const inputFillCall = calls.slice(inputFillBefore).find((c) => c.args[0] === 'fill');
+  assert.equal(inputFillCall.args[inputFillCall.args.indexOf('--value') + 1], 'Line1 Line2');
+
+  // typeTag on contenteditable: MUST use `fill --no-clear --selector`, NEVER `press --selector`!
+  fillTargetTag = 'div';
+  fillTargetContentEditable = true;
+  const tagIdxBefore = calls.length;
+  await page1.typeTag(['.editor'], 'AI视频', { commitKey: 'Enter' });
+  const tagSlice = calls.slice(tagIdxBefore);
+  const tagFill = tagSlice.find((c) => c.args[0] === 'fill');
+  assert.ok(tagFill, 'typeTag must call bsk fill');
+  assert.ok(tagFill.args.includes('--no-clear'), 'typeTag must use --no-clear');
+  assert.equal(tagFill.args[tagFill.args.indexOf('--value') + 1], ' #AI视频');
+  const tagPresses = tagSlice.filter((c) => c.args[0] === 'press');
+  assert.equal(tagPresses.length, 1);
+  assert.equal(tagPresses[0].args.includes('--selector'), false, 'typeTag commit press MUST NOT pass --selector on contenteditable');
+  assert.ok(tagPresses[0].args.includes('--context') && tagPresses[0].args.includes('--observation'));
+
+  // keepTargetOpen(page1): session.close({ closeOwnedTabs: true }) closes non-kept page2, keeps page1, and SKIPS `bsk session stop`!
+  session.keepTargetOpen(page1);
+  const closeIdxBefore = calls.length;
+  await session.close({ closeOwnedTabs: true });
+  const closeSlice = calls.slice(closeIdxBefore);
+  const closedTabIds = closeSlice.filter((c) => c.args[0] === 'tab' && c.args[1] === 'close').map((c) => c.args[2]);
+  assert.deepEqual(closedTabIds, ['200'], 'must close non-kept tab 200 and leave kept tab 101 open');
+  assert.equal(closeSlice.some((c) => c.args[0] === 'session' && c.args[1] === 'stop'), false, 'must skip bsk session stop when a tab is kept open');
+
+  // Session without kept tabs MUST call `bsk session stop` (and focus: true passes --focus)
+  const focusSession = await BskSession.connect({
+    bskBin: fakeBin,
+    focus: true,
+    env: {},
+    execFileImpl: mockExec,
+    fastMode: true,
+  });
+  const focusStart = calls.filter((c) => c.args[0] === 'session' && c.args[1] === 'start').at(-1);
+  assert.ok(focusStart.args.includes('--focus'), 'focus: true must pass --focus to bsk session start');
+  const stopIdxBefore = calls.length;
+  await focusSession.close({ closeOwnedTabs: true });
+  assert.equal(calls.slice(stopIdxBefore).some((c) => c.args[0] === 'session' && c.args[1] === 'stop'), true, 'must call bsk session stop when no tabs are kept');
+});
+
+test('openBrowserSession & probeBrowserTransport: auto prefers bsk, falls back to cdp with fallbackReason, explicit bsk throws, explicit cdpUrl routes to cdp', async () => {
+  const makeFakeBskSession = () => ({
+    source: 'bsk',
+    backend: 'bsk',
+    browserInstanceId: 'daa12984',
+    browserLabel: '主要浏览器',
+    sessionId: 'sess-bsk-9',
+    async close() {},
+  });
+  const makeFakeCdpSession = (cdpUrl = 'http://127.0.0.1:9222') => ({
+    source: 'dedicated_profile',
+    cdpUrl,
+    profileDir: '/tmp/svp-profile',
+    async close() {},
+  });
+
+  // 1. auto prefers bsk when available
+  let cdpCalled = false;
+  const sAutoBsk = await openBrowserSession({
+    backend: 'auto',
+    bskProbeImpl: async () => ({
+      available: true,
+      bskBin: '/mock/bsk',
+      browser: { instance_id: 'daa12984', label: '主要浏览器' },
+    }),
+    bskConnectImpl: async () => makeFakeBskSession(),
+    cdpConnectImpl: async () => { cdpCalled = true; return makeFakeCdpSession(); },
+  });
+  assert.equal(cdpCalled, false);
+  assert.deepEqual(sAutoBsk.transportMeta, {
+    backend: 'bsk',
+    source: 'bsk',
+    browserInstanceId: 'daa12984',
+    browserLabel: '主要浏览器',
+    sessionId: 'sess-bsk-9',
+  });
+
+  // 2. auto falls back to cdp with fallbackReason when bsk unavailable
+  const sAutoFallback = await openBrowserSession({
+    backend: 'auto',
+    bskProbeImpl: async () => ({ available: false, reason: 'no_connected_browsers' }),
+    bskConnectImpl: async () => { throw new Error('should not connect bsk'); },
+    cdpConnectImpl: async () => makeFakeCdpSession(),
+  });
+  assert.equal(sAutoFallback.transportMeta.backend, 'cdp');
+  assert.equal(sAutoFallback.transportMeta.fallbackReason, 'no_connected_browsers');
+  assert.equal(sAutoFallback.transportMeta.cdpUrl, 'http://127.0.0.1:9222');
+
+  // 3. auto falls back to cdp with fallbackReason when bsk connect fails
+  const sAutoConnectErr = await openBrowserSession({
+    backend: 'auto',
+    bskProbeImpl: async () => ({ available: true, bskBin: '/mock/bsk', browser: { instance_id: 'daa12984' } }),
+    bskConnectImpl: async () => { throw new BskError({ exitCode: 2, reason: 'daemon_unreachable', message: 'daemon down' }); },
+    cdpConnectImpl: async () => makeFakeCdpSession(),
+  });
+  assert.equal(sAutoConnectErr.transportMeta.backend, 'cdp');
+  assert.equal(sAutoConnectErr.transportMeta.fallbackReason, 'daemon_unreachable');
+
+  // 4. explicit backend: 'bsk' throws when unavailable (NEVER silently downgrades to CDP!)
+  let cdpCalledOnStrictBsk = false;
+  await assert.rejects(
+    () => openBrowserSession({
+      backend: 'bsk',
+      bskConnectImpl: async () => { throw new BskError({ exitCode: 2, reason: 'bsk_not_found', message: 'bsk unavailable' }); },
+      cdpConnectImpl: async () => { cdpCalledOnStrictBsk = true; return makeFakeCdpSession(); },
+    }),
+    /bsk unavailable/,
+  );
+  assert.equal(cdpCalledOnStrictBsk, false, 'explicit backend="bsk" must never silently downgrade to CDP');
+
+  // 5. explicit cdpUrl routes straight to CDP without probing BSK
+  let bskProbedOnExplicitCdp = false;
+  const sExplicitCdp = await openBrowserSession({
+    backend: 'auto',
+    cdpUrl: 'http://127.0.0.1:9333',
+    bskProbeImpl: async () => { bskProbedOnExplicitCdp = true; return { available: true }; },
+    cdpConnectImpl: async (opts) => makeFakeCdpSession(opts.cdpUrl),
+  });
+  assert.equal(bskProbedOnExplicitCdp, false, 'explicit cdpUrl must bypass bsk probe');
+  assert.equal(sExplicitCdp.transportMeta.backend, 'cdp');
+  assert.equal(sExplicitCdp.transportMeta.cdpUrl, 'http://127.0.0.1:9333');
+  assert.equal(sExplicitCdp.transportMeta.fallbackReason, undefined);
+
+  // 6. probeBrowserTransport returns read-only summary
+  const summary = await probeBrowserTransport({
+    backend: 'auto',
+    env: {},
+    bskProbeImpl: async () => ({ available: true, bskBin: '/mock/bsk', browser: { instance_id: 'daa12984', label: '主要浏览器' } }),
+  });
+  assert.equal(summary.requestedBackend, 'auto');
+  assert.equal(summary.selectedBackend, 'bsk');
+  assert.equal(summary.bsk.available, true);
+});
+
+test('v0.3.0 server.mjs & job-runner.mjs BSK wiring: transport meta, open_login focus+keepTargetOpen, bsk_native_browser cookie skip', async (t) => {
+  const { tmpDir, videoPath } = createTempMedia(t);
+  const dataDir = path.join(tmpDir, 'data');
+  const dyCookie = path.join(tmpDir, 'dy.cookie');
+  fs.writeFileSync(dyCookie, 'sessionid=secret_token\n', { mode: 0o600 });
+
+  const sessionCalls = [];
+  const createMockBskSession = (opts) => {
+    const kept = [];
+    const closeCalls = [];
+    const pages = [];
+    return {
+      source: 'bsk',
+      backend: 'bsk',
+      browserInstanceId: opts.browserId || 'daa12984',
+      browserLabel: '主要浏览器',
+      sessionId: 'bsk-live-1',
+      profileDir: '主要浏览器',
+      transportMeta: {
+        backend: 'bsk',
+        source: 'bsk',
+        browserInstanceId: opts.browserId || 'daa12984',
+        browserLabel: '主要浏览器',
+        sessionId: 'bsk-live-1',
+      },
+      kept,
+      closeCalls,
+      pages,
+      async newPage() {
+        const page = createMockPage({
+          visibleSelectors: [
+            'input[type="file"][accept*="video"]',
+            'input[placeholder*="填写作品标题"]',
+            '.zone-container',
+            '.preview-video',
+            'button[class*="draft"]',
+            'input[data-testid="fileInput"]',
+            '[data-testid="tweetTextarea_0"]',
+            '[data-testid="tweetButton"]',
+          ],
+          initialText: '重新上传',
+          accountName: '真实Chrome创作者',
+          onSetFiles: (st) => { st.visibleSelectors.add('[data-testid="attachments"]'); },
+        });
+        pages.push(page);
+        return page;
+      },
+      keepTargetOpen(page) {
+        kept.push(page);
+      },
+      async close(closeOpts) {
+        closeCalls.push(closeOpts);
+      },
+    };
+  };
+
+  let lastSession = null;
+  const service = createPublisherService({
+    dataDir,
+    sessionFactory: async (opts) => {
+      sessionCalls.push(opts);
+      lastSession = createMockBskSession(opts);
+      return lastSession;
+    },
+    probeMediaFile: (file, opts) => probeMediaFile(file, { ...opts, skipFfprobe: true }),
+  });
+
+  // 1. check_accounts forwards backend & browserId, returns transportMeta, skips cookieFiles cleanly with bsk_native_browser
+  const checkRes = await service.callTool('check_accounts', {
+    platforms: ['douyin'],
+    backend: 'bsk',
+    browserId: 'daa12984',
+    cookieFiles: { douyin: dyCookie },
+  });
+  assert.equal(checkRes.ok, true);
+  assert.equal(sessionCalls.at(-1).backend, 'bsk');
+  assert.equal(sessionCalls.at(-1).browserId, 'daa12984');
+  assert.equal(sessionCalls.at(-1).focus, false);
+  assert.equal(checkRes.transport.backend, 'bsk');
+  assert.equal(checkRes.transport.browserLabel, '主要浏览器');
+  assert.equal(checkRes.accounts[0].loggedIn, true);
+  assert.equal(checkRes.accounts[0].cookieInjectionSkipped, 'bsk_native_browser');
+  assert.equal(checkRes.accounts[0].diagnostics.cookieInjectionSkipped, 'bsk_native_browser');
+  assert.equal(checkRes.accounts[0].cookieInjectionBlocked, undefined);
+  assert.equal(lastSession.pages[0].state.cookies.length, 0);
+
+  // 2. open_login passes focus: true, calls keepTargetOpen(page) BEFORE close({ closeOwnedTabs: true }), returns transport
+  const loginRes = await service.callTool('open_login', {
+    platform: 'douyin',
+    backend: 'auto',
+    browserId: 'daa12984',
+  });
+  assert.equal(loginRes.ok, true);
+  assert.equal(sessionCalls.at(-1).focus, true, 'open_login must pass focus: true');
+  assert.equal(loginRes.transport.backend, 'bsk');
+  assert.equal(loginRes.transport.browserLabel, '主要浏览器');
+  assert.equal(lastSession.kept.length, 1, 'open_login must call session.keepTargetOpen(page)');
+  assert.deepEqual(lastSession.closeCalls, [{ closeOwnedTabs: true }], 'open_login must close with closeOwnedTabs: true after keepTargetOpen');
+
+  // 3. start_publish_job & get_publish_job include transport, skip cookieFiles on bsk, and keep X draft tab open via keepTargetOpen + close({ closeOwnedTabs: true })
+  const jobRes = await service.callTool('start_publish_job', {
+    videoPath,
+    title: 'BSK 真实浏览器测试',
+    description: '零重复登录直发草稿',
+    platforms: ['douyin', 'x'],
+    mode: 'draft',
+    backend: 'auto',
+    browserId: 'daa12984',
+    cookieFiles: { douyin: dyCookie },
+    options: { pollIntervalMs: 1 },
+    waitSeconds: 5,
+  });
+  assert.equal(jobRes.ok, true);
+  assert.equal(jobRes.done, true);
+  assert.equal(jobRes.transport.backend, 'bsk');
+  assert.equal(jobRes.transport.browserLabel, '主要浏览器');
+  assert.equal(jobRes.job.transport.backend, 'bsk');
+  assert.equal(jobRes.job.results[0].diagnostics.cookieInjectionSkipped, 'bsk_native_browser');
+  assert.equal(jobRes.job.results[0].cookieInjectionBlocked, undefined);
+  assert.equal(lastSession.kept.length, 1, 'X draft tab must be kept via session.keepTargetOpen(page)');
+  assert.deepEqual(lastSession.closeCalls, [{ closeOwnedTabs: true }]);
+
+  const getRes = await service.callTool('get_publish_job', { jobId: jobRes.job.jobId, waitSeconds: 0 });
+  assert.equal(getRes.ok, true);
+  assert.equal(getRes.transport.backend, 'bsk');
+  assert.equal(getRes.job.transport.browserLabel, '主要浏览器');
+});
+
+test('regressions (#62): newPage(about:blank) skips sync, sole-tab close spawns anchor tab across sequential multi-platform tabs, Bilibili iframe navigates into videoUpload frame', async (t) => {
+  const { tmpDir, videoPath } = createTempMedia(t);
+  const fakeBin = '/mock/bin/bsk';
+
+  // 1 & 2. BSK protocol regression: enforce live bsk 0.5.0 invariants inside mock CLI:
+  //   - `sync` on an `about:blank` tab MUST fail with "Page frames cannot be observed: 0 (about:)"
+  //   - closing the sole tab in the session marks the session closed (`session_window_closed`)
+  const openTabs = new Map(); // tabId -> { url }
+  let nextCreatedTab = 500;
+  let sessionAlive = false;
+  let syncSeq = 0;
+  const cmdLog = [];
+
+  const strictBskExec = async (_bin, args) => {
+    cmdLog.push([...args]);
+    const cmd = args[0];
+    const sub = args[1];
+
+    if (cmd === 'browsers') {
+      return {
+        stdout: JSON.stringify([
+          { instance_id: 'daa12984', label: '主要浏览器', browser_name: 'Chrome', unresponsive: false, version_skew: false },
+        ]),
+        stderr: '',
+      };
+    }
+    if (cmd === 'session' && sub === 'start') {
+      sessionAlive = true;
+      openTabs.clear();
+      openTabs.set('101', { url: 'about:blank' });
+      return { stdout: JSON.stringify({ session_id: 'strict-sess', agent_window_id: 77, browser_instance_id: 'daa12984' }), stderr: '' };
+    }
+    if (cmd === 'session' && sub === 'stop') {
+      sessionAlive = false;
+      openTabs.clear();
+      return { stdout: JSON.stringify({ stopped: [args[2]], failed: [] }), stderr: '' };
+    }
+    if (!sessionAlive) {
+      const err = new Error('session_window_closed');
+      err.code = 1;
+      err.stdout = JSON.stringify({ code: 'not_found', data: { reason: 'session_window_closed' } });
+      throw err;
+    }
+    if (cmd === 'tab' && sub === 'list') {
+      return {
+        stdout: JSON.stringify({
+          tabs: [...openTabs.entries()].map(([id, info]) => ({ tab_id: Number(id), url: info.url, scope: 'agent' })),
+        }),
+        stderr: '',
+      };
+    }
+    if (cmd === 'tab' && sub === 'create') {
+      const id = String(nextCreatedTab++);
+      openTabs.set(id, { url: 'about:blank' });
+      return { stdout: JSON.stringify({ tab_id: Number(id), url: 'about:blank' }), stderr: '' };
+    }
+    if (cmd === 'tab' && sub === 'close') {
+      const id = String(args[2]);
+      openTabs.delete(id);
+      if (openTabs.size === 0) {
+        sessionAlive = false;
+      }
+      return { stdout: JSON.stringify({ tab_id: Number(id) }), stderr: '' };
+    }
+    if (cmd === 'sync') {
+      const id = String(args[args.indexOf('--tab-id') + 1]);
+      const tab = openTabs.get(id);
+      if (!tab || tab.url === 'about:blank') {
+        const err = new Error('Page frames cannot be observed: 0 (about:)');
+        err.code = 1;
+        err.stdout = JSON.stringify({ error: 'Page frames cannot be observed: 0 (about:)' });
+        throw err;
+      }
+      syncSeq += 1;
+      return { stdout: JSON.stringify({ context_id: `c${syncSeq}`, observation_id: `o${syncSeq}`, tab_id: Number(id) }), stderr: '' };
+    }
+    if (cmd === 'navigate') {
+      const id = String(args[args.indexOf('--tab-id') + 1]);
+      const url = args[1];
+      openTabs.set(id, { url });
+      return { stdout: JSON.stringify({ tab_id: Number(id), url, final_url: url, reached: true }), stderr: '' };
+    }
+    if (cmd === 'evaluate') {
+      const id = String(args[args.indexOf('--tab-id') + 1]);
+      const url = openTabs.get(id)?.url || 'about:blank';
+      return { stdout: JSON.stringify({ ok: true, value: url }), stderr: '' };
+    }
+    return { stdout: '{}', stderr: '' };
+  };
+
+  const sess = await BskSession.connect({ bskBin: fakeBin, env: {}, execFileImpl: strictBskExec, fastMode: true });
+
+  // Simulate 3 sequential platforms opening a tab, navigating to an http URL, and closing the tab (like check_accounts!)
+  const urls = [
+    'https://creator.douyin.com/creator-micro/content/upload',
+    'https://creator.xiaohongshu.com/publish/publish',
+    'https://x.com/compose/post',
+  ];
+  const usedTabIds = [];
+  for (const targetUrl of urls) {
+    const syncsBeforeNewPage = cmdLog.filter((a) => a[0] === 'sync').length;
+    const page = await sess.newPage();
+    assert.equal(cmdLog.filter((a) => a[0] === 'sync').length, syncsBeforeNewPage, 'newPage("about:blank") MUST NOT call bsk sync');
+    usedTabIds.push(page.tabId);
+
+    const nav = await page.navigate(targetUrl);
+    assert.equal(nav.url, targetUrl);
+    await page.close();
+    assert.equal(sessionAlive, true, 'closing sole tab must spawn about:blank anchor tab so session stays alive');
+    assert.equal(openTabs.size, 1, 'anchor tab must remain open between sequential platforms');
+  }
+  assert.deepEqual(usedTabIds, [101, 500, 501], 'each subsequent newPage() must reuse the anchor tab spawned by previous close()');
+
+  // Final session.close({ closeOwnedTabs: true }) with no kept tabs skips per-tab sync/close and calls `session stop` directly
+  const closeLogStart = cmdLog.length;
+  await sess.close({ closeOwnedTabs: true });
+  const teardownCmds = cmdLog.slice(closeLogStart);
+  assert.equal(teardownCmds.some((a) => a[0] === 'sync'), false, 'teardown with 0 kept tabs must not call sync on anchor tab');
+  assert.equal(teardownCmds.some((a) => a[0] === 'tab' && a[1] === 'close'), false);
+  assert.equal(teardownCmds.some((a) => a[0] === 'session' && a[1] === 'stop'), true);
+  assert.equal(sessionAlive, false);
+
+  // 3. Bilibili same-origin iframe top-document check:
+  // Even when queryAny(VIDEO_INPUT_SELECTORS) finds the input inside the same-origin iframe,
+  // bilibili.publishVideo MUST still navigate into iframe[name="videoUpload"] when topDocHasInput is false!
+  const biliAdapter = getAdapter('bilibili');
+  const frameUrl = 'https://member.bilibili.com/platform/upload/video/frame?page_from=creative_home';
+  const biliIframePage = createMockPage({
+    iframeSrc: frameUrl,
+    topDocHasInput: (st) => st.currentUrl === frameUrl,
+    visibleSelectors: [
+      '.bcc-upload-wrapper input[type="file"]',
+      'input[placeholder*="请输入稿件标题"]',
+      'input[placeholder*="按回车键Enter创建标签"]',
+      '.ql-editor',
+      'span.submit-draft',
+    ],
+    initialText: '上传完成 100%',
+  });
+  const biliRes = await biliAdapter.publishVideo(biliIframePage, {
+    videoPath,
+    title: 'B站 iframe 顶层文档回归测试',
+    description: '确保 BSK 进入 upload frame 顶层文档再上传',
+    tags: ['AI'],
+    mode: 'draft',
+    screenshotDir: tmpDir,
+    options: { pollIntervalMs: 1 },
+  });
+  assert.equal(biliRes.status, 'draft_saved');
+  const navUrls = biliIframePage.state.calls.filter((c) => c.method === 'navigate').map((c) => c.url);
+  assert.ok(navUrls.includes(frameUrl), `Bilibili must navigate into upload iframe URL when input is not on top doc; got ${JSON.stringify(navUrls)}`);
+  const enterFrameStep = biliRes.diagnostics.steps.find((s) => s.step === 'enter_upload_frame');
+  assert.equal(enterFrameStep?.frameUrl, frameUrl);
 });

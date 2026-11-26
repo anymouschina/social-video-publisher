@@ -6,7 +6,39 @@ import {
   clampWaitSeconds,
   redactSensitiveText,
 } from './constants.mjs';
-import { BrowserSession, parseCookieFile } from './cdp.mjs';
+import { parseCookieFile } from './cdp.mjs';
+import { openBrowserSession } from './transport.mjs';
+
+const BACKEND_ENUM = ['auto', 'bsk', 'cdp'];
+
+function normalizeBackend(raw) {
+  const val = String(raw || 'auto').trim().toLowerCase();
+  return BACKEND_ENUM.includes(val) ? val : null;
+}
+
+function resolveTransportMeta(session) {
+  if (!session || typeof session !== 'object') return null;
+  if (session.transportMeta && typeof session.transportMeta === 'object') {
+    return { ...session.transportMeta };
+  }
+  const backend = session.backend || (session.source === 'bsk' ? 'bsk' : 'cdp');
+  return {
+    backend,
+    source: session.source || backend,
+    ...(session.browserInstanceId ? { browserInstanceId: session.browserInstanceId } : {}),
+    ...(session.browserLabel ? { browserLabel: session.browserLabel } : {}),
+    ...(session.sessionId ? { sessionId: session.sessionId } : {}),
+    ...(session.cdpUrl ? { cdpUrl: session.cdpUrl } : {}),
+    ...(session.profileDir !== undefined ? { profileDir: session.profileDir || null } : {}),
+  };
+}
+
+function isBskSession(session) {
+  if (!session || typeof session !== 'object') return false;
+  return session.backend === 'bsk'
+    || session.transportMeta?.backend === 'bsk'
+    || session.source === 'bsk';
+}
 
 function makeId(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
@@ -46,7 +78,7 @@ export class PublishJobRunner {
     this.getAdapter = getAdapter;
     this.resolvePlatformId = resolvePlatformId;
     this.env = env;
-    this.sessionFactory = sessionFactory || ((opts) => BrowserSession.connect({ ...opts, env: this.env }));
+    this.sessionFactory = sessionFactory || ((opts) => openBrowserSession({ ...opts, env: this.env }));
     this.activeJobs = new Map();
     this.waiters = new Map();
   }
@@ -130,6 +162,7 @@ export class PublishJobRunner {
     return {
       ok: true,
       done: !isRunning,
+      transport: latest.transport || null,
       job: latest,
       nextAction: isRunning
         ? `任务仍在执行中（当前平台：${latest.currentPlatform || '准备中'}），请继续调用 get_publish_job(jobId="${latest.jobId}") 轮询进度`
@@ -144,6 +177,15 @@ export class PublishJobRunner {
         ok: false,
         status: 'invalid_mode',
         error: `不支持的发布模式：${mode}（仅支持 draft 或 publish）`,
+      };
+    }
+
+    const backend = normalizeBackend(opts.backend);
+    if (!backend) {
+      return {
+        ok: false,
+        status: 'invalid_backend',
+        error: `不支持的浏览器后端：${opts.backend}（仅支持 auto、bsk 或 cdp）`,
       };
     }
 
@@ -181,6 +223,7 @@ export class PublishJobRunner {
       planId: plan.planId || null,
       mode,
       status: 'running',
+      transport: null,
       videoPath: plan.video?.path || plan.videoPath || '',
       videoSha256: plan.video?.sha256 || plan.videoSha256 || '',
       platforms: items.map((item) => item.platform),
@@ -206,20 +249,32 @@ export class PublishJobRunner {
 
     const cookieFiles = opts.cookieFiles && typeof opts.cookieFiles === 'object' ? opts.cookieFiles : {};
     const cdpUrl = opts.cdpUrl || '';
+    const browserId = opts.browserId || '';
     const allowUnsafeCookieInjection = opts.allowUnsafeCookieInjection === true;
 
     // Fire sequential async runner without blocking tool call beyond waitSeconds.
-    void this._executeJob(job, items, { cookieFiles, cdpUrl, allowUnsafeCookieInjection });
+    void this._executeJob(job, items, { backend, browserId, cookieFiles, cdpUrl, allowUnsafeCookieInjection });
 
     const waitSeconds = clampWaitSeconds(opts.waitSeconds, DEFAULT_WAIT_SECONDS);
     return this.waitForJob(jobId, waitSeconds);
   }
 
-  async _applyCookieFileIfPresent(page, platformId, cookieFiles, { allowUnsafeCookieInjection = false, adapter = null } = {}) {
+  async _applyCookieFileIfPresent(page, platformId, cookieFiles, { allowUnsafeCookieInjection = false, adapter = null, isBsk = false } = {}) {
     const filePath = cookieFiles[platformId]
       || Object.entries(cookieFiles).find(([key]) => this.resolvePlatformId(key) === platformId)?.[1];
     if (!filePath) {
-      return { applied: false, blocked: false, skippedAlreadyLoggedIn: false, count: 0 };
+      return { applied: false, blocked: false, skippedAlreadyLoggedIn: false, skippedReason: null, count: 0 };
+    }
+
+    // Real logged-in Chrome via BrowserSkill (bsk) already owns native cookies & device keys.
+    if (isBsk) {
+      return {
+        applied: false,
+        blocked: false,
+        skippedAlreadyLoggedIn: false,
+        skippedReason: 'bsk_native_browser',
+        count: 0,
+      };
     }
 
     // Device-bound cookie-transplant guard: block cross-profile cookie injection by default.
@@ -228,6 +283,7 @@ export class PublishJobRunner {
         applied: false,
         blocked: true,
         skippedAlreadyLoggedIn: false,
+        skippedReason: null,
         count: 0,
         reason: 'device_bound_cookie_blocked',
       };
@@ -243,6 +299,7 @@ export class PublishJobRunner {
             applied: false,
             blocked: false,
             skippedAlreadyLoggedIn: true,
+            skippedReason: 'already_logged_in',
             count: 0,
           };
         }
@@ -255,14 +312,16 @@ export class PublishJobRunner {
     if (cookies.length > 0) {
       await page.setCookies(cookies);
     }
-    return { applied: true, blocked: false, skippedAlreadyLoggedIn: false, count: cookies.length };
+    return { applied: true, blocked: false, skippedAlreadyLoggedIn: false, skippedReason: null, count: cookies.length };
   }
 
-  async _executeJob(job, items, { cookieFiles, cdpUrl, allowUnsafeCookieInjection = false }) {
+  async _executeJob(job, items, { backend = 'auto', browserId = '', cookieFiles, cdpUrl, allowUnsafeCookieInjection = false }) {
     let session = null;
-    let keepAnyTabs = false;
     try {
-      session = await this.sessionFactory({ cdpUrl });
+      session = await this.sessionFactory({ backend, browserId, cdpUrl, focus: false });
+      const bskNative = isBskSession(session);
+      job.transport = resolveTransportMeta(session);
+      this._persist(job);
 
       for (const item of items) {
         if (job.cancelled) {
@@ -328,8 +387,14 @@ export class PublishJobRunner {
           const cookieOutcome = await this._applyCookieFileIfPresent(page, item.platform, cookieFiles, {
             allowUnsafeCookieInjection,
             adapter,
+            isBsk: bskNative,
           });
-          if (cookieOutcome.blocked) {
+          if (cookieOutcome.skippedReason === 'bsk_native_browser') {
+            onProgress(
+              'cookie_guard',
+              `${item.platform} 已通过 BrowserSkill (bsk) 直接复用本机真实浏览器登录态与设备密钥，已自动跳过 cookieFiles 注入`,
+            );
+          } else if (cookieOutcome.blocked) {
             onProgress(
               'cookie_guard',
               `已阻止对设备绑定平台 ${item.platform} 注入跨配置 cookieFiles，改为直接检查持久化 Chrome 登录态`,
@@ -358,7 +423,7 @@ export class PublishJobRunner {
           const normalizedDiagnostics = {
             ...(rawResult?.diagnostics || {}),
             ...(cookieOutcome.blocked ? { cookieInjectionBlocked: true } : {}),
-            ...(cookieOutcome.skippedAlreadyLoggedIn ? { cookieInjectionSkipped: 'already_logged_in' } : {}),
+            ...(cookieOutcome.skippedReason ? { cookieInjectionSkipped: cookieOutcome.skippedReason } : {}),
           };
 
           let normalizedMessage = redactSensitiveText(rawResult?.message || '');
@@ -378,7 +443,6 @@ export class PublishJobRunner {
           };
 
           if (shouldKeepTabOpen(item.platform, normalized)) {
-            keepAnyTabs = true;
             if (typeof session.keepTargetOpen === 'function') {
               session.keepTargetOpen(page);
             }
@@ -448,7 +512,8 @@ export class PublishJobRunner {
     } finally {
       if (session && typeof session.close === 'function') {
         try {
-          await session.close({ closeOwnedTabs: !keepAnyTabs });
+          // Non-kept tabs are closed; any page marked via keepTargetOpen(page) stays open (and keeps BSK Agent Window open).
+          await session.close({ closeOwnedTabs: true });
         } catch {
           // Ignore close errors.
         }

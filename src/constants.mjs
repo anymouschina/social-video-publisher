@@ -2,7 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 export const PLUGIN_NAME = 'social-video-publisher';
-export const PLUGIN_VERSION = '0.2.0';
+export const PLUGIN_VERSION = '0.3.0';
 export const MCP_SERVER_NAME = 'social_pub';
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
 
