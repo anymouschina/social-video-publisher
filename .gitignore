@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+*.log
+tmp/
+.tmp/
+*.cookie
+cookies.txt
+chrome-profile/

@@ -1,0 +1,13 @@
+{
+  "name": "social-video-publisher-market",
+  "plugins": [
+    {
+      "name": "social-video-publisher",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

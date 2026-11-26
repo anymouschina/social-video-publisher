@@ -1,0 +1,18 @@
+{
+  "name": "social-video-publisher",
+  "version": "0.1.0",
+  "description": "一条视频多平台适配并发布或存草稿至小红书、抖音、推特（X）与 B 站；基于本机真实 Chrome CDP，零第三方依赖，默认存草稿且公开发布前强制人工确认。",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "多平台视频发布",
+    "shortDescription": "一条视频多平台适配并发布到小红书、抖音、推特(X)、B站",
+    "category": "Productivity",
+    "logo": "https://tanvas-ai.tos-cn-guangzhou.volces.com/gen/plugin-logos/20261126/social-video-publisher-d32c9cdf.jpg",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "把这条视频分别适配文案并先存草稿到小红书、抖音和推特(X)"
+    ]
+  },
+  "license": "MIT"
+}

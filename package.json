@@ -1,0 +1,30 @@
+{
+  "name": "social-video-publisher",
+  "version": "0.1.0",
+  "description": "Zero-dependency TapCanvas / Claude Code / Codex plugin for multi-platform video publishing (Xiaohongshu, Douyin, X/Twitter, Bilibili) over real Chrome CDP.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test tests/plugin.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anymouschina/social-video-publisher.git"
+  },
+  "keywords": [
+    "mcp",
+    "tapcanvas",
+    "claude-code",
+    "codex",
+    "video-publisher",
+    "xiaohongshu",
+    "douyin",
+    "twitter",
+    "x",
+    "bilibili"
+  ]
+}
