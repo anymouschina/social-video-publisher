@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import {
   DEFAULT_WAIT_SECONDS,
+  DEVICE_BOUND_COOKIE_PLATFORMS,
   clampWaitSeconds,
   redactSensitiveText,
 } from './constants.mjs';
@@ -24,9 +25,16 @@ function summarizeJobStatus(results, cancelled) {
   return 'failed';
 }
 
-function shouldKeepTabOpen(platform, result) {
+export function shouldKeepTabOpen(platform, result) {
   if (!result) return false;
   if (result.status === 'needs_login' || result.status === 'needs_verification') return true;
+  if (
+    result.diagnostics?.draftMethod === 'form_populated' ||
+    result.diagnostics?.draftMethod === 'composer_populated'
+  ) {
+    return true;
+  }
+  if (result.diagnostics?.keepTabOpen === true) return true;
   // On X (Twitter), draft mode leaves the populated composer open for user inspection.
   if (platform === 'x' && result.status === 'draft_saved') return true;
   return false;
@@ -198,26 +206,59 @@ export class PublishJobRunner {
 
     const cookieFiles = opts.cookieFiles && typeof opts.cookieFiles === 'object' ? opts.cookieFiles : {};
     const cdpUrl = opts.cdpUrl || '';
+    const allowUnsafeCookieInjection = opts.allowUnsafeCookieInjection === true;
 
     // Fire sequential async runner without blocking tool call beyond waitSeconds.
-    void this._executeJob(job, items, { cookieFiles, cdpUrl });
+    void this._executeJob(job, items, { cookieFiles, cdpUrl, allowUnsafeCookieInjection });
 
     const waitSeconds = clampWaitSeconds(opts.waitSeconds, DEFAULT_WAIT_SECONDS);
     return this.waitForJob(jobId, waitSeconds);
   }
 
-  async _applyCookieFileIfPresent(page, platformId, cookieFiles) {
+  async _applyCookieFileIfPresent(page, platformId, cookieFiles, { allowUnsafeCookieInjection = false, adapter = null } = {}) {
     const filePath = cookieFiles[platformId]
       || Object.entries(cookieFiles).find(([key]) => this.resolvePlatformId(key) === platformId)?.[1];
-    if (!filePath) return { applied: false, count: 0 };
+    if (!filePath) {
+      return { applied: false, blocked: false, skippedAlreadyLoggedIn: false, count: 0 };
+    }
+
+    // Device-bound cookie-transplant guard: block cross-profile cookie injection by default.
+    if (DEVICE_BOUND_COOKIE_PLATFORMS.has(platformId) && !allowUnsafeCookieInjection) {
+      return {
+        applied: false,
+        blocked: true,
+        skippedAlreadyLoggedIn: false,
+        count: 0,
+        reason: 'device_bound_cookie_blocked',
+      };
+    }
+
+    // Even when allowed (allowUnsafeCookieInjection=true or non-device-bound platform),
+    // NEVER overwrite a persistent Chrome profile session that is already logged in.
+    if (adapter && typeof adapter.checkAuth === 'function') {
+      try {
+        const nativeAuth = await adapter.checkAuth(page);
+        if (nativeAuth && (nativeAuth.loggedIn || nativeAuth.status === 'logged_in')) {
+          return {
+            applied: false,
+            blocked: false,
+            skippedAlreadyLoggedIn: true,
+            count: 0,
+          };
+        }
+      } catch {
+        // If native auth probe throws, proceed to inject below.
+      }
+    }
+
     const cookies = parseCookieFile(filePath, platformId);
     if (cookies.length > 0) {
       await page.setCookies(cookies);
     }
-    return { applied: true, count: cookies.length };
+    return { applied: true, blocked: false, skippedAlreadyLoggedIn: false, count: cookies.length };
   }
 
-  async _executeJob(job, items, { cookieFiles, cdpUrl }) {
+  async _executeJob(job, items, { cookieFiles, cdpUrl, allowUnsafeCookieInjection = false }) {
     let session = null;
     let keepAnyTabs = false;
     try {
@@ -267,7 +308,6 @@ export class PublishJobRunner {
         let page = null;
         try {
           page = await session.newPage();
-          await this._applyCookieFileIfPresent(page, item.platform, cookieFiles);
 
           const onProgress = (stageOrEvent, message) => {
             const event = stageOrEvent && typeof stageOrEvent === 'object'
@@ -285,6 +325,22 @@ export class PublishJobRunner {
             this._persist(job);
           };
 
+          const cookieOutcome = await this._applyCookieFileIfPresent(page, item.platform, cookieFiles, {
+            allowUnsafeCookieInjection,
+            adapter,
+          });
+          if (cookieOutcome.blocked) {
+            onProgress(
+              'cookie_guard',
+              `已阻止对设备绑定平台 ${item.platform} 注入跨配置 cookieFiles，改为直接检查持久化 Chrome 登录态`,
+            );
+          } else if (cookieOutcome.skippedAlreadyLoggedIn) {
+            onProgress(
+              'cookie_guard',
+              `${item.platform} 持久化 Chrome 配置目录已处于登录状态，已跳过重复注入 cookieFiles`,
+            );
+          }
+
           const rawResult = await adapter.publishVideo(page, {
             videoPath: item.videoPath || job.videoPath,
             mediaInfo: item.mediaInfo || null,
@@ -299,13 +355,26 @@ export class PublishJobRunner {
             onProgress,
           });
 
+          const normalizedDiagnostics = {
+            ...(rawResult?.diagnostics || {}),
+            ...(cookieOutcome.blocked ? { cookieInjectionBlocked: true } : {}),
+            ...(cookieOutcome.skippedAlreadyLoggedIn ? { cookieInjectionSkipped: 'already_logged_in' } : {}),
+          };
+
+          let normalizedMessage = redactSensitiveText(rawResult?.message || '');
+          if (cookieOutcome.blocked && (rawResult?.status || 'failed') === 'needs_login') {
+            const guardHint = `已拒绝向 ${item.platform} 注入跨配置 Cookie（该平台存在设备/密钥绑定，跨配置移植会触发风控强制下线）。请调用 open_login({ platform: "${item.platform}" }) 在持久化 Chrome 窗口中原生登录一次。`;
+            normalizedMessage = normalizedMessage ? `${guardHint} ${normalizedMessage}` : guardHint;
+          }
+
           const normalized = {
             platform: item.platform,
             status: rawResult?.status || 'failed',
             url: rawResult?.url || null,
             screenshotPath: rawResult?.screenshotPath || null,
-            message: redactSensitiveText(rawResult?.message || ''),
-            diagnostics: rawResult?.diagnostics || {},
+            ...(cookieOutcome.blocked ? { cookieInjectionBlocked: true } : {}),
+            message: normalizedMessage,
+            diagnostics: normalizedDiagnostics,
           };
 
           if (shouldKeepTabOpen(item.platform, normalized)) {

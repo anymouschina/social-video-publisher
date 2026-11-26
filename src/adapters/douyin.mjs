@@ -1,17 +1,21 @@
 import {
+  buildGuardAbortResult,
   buildResult,
   captureScreenshot,
+  checkPageGuardState,
   clampText,
   clickWithTextFallback,
-  detectVerificationPrompt,
   formatScheduleLocal,
   humanDelay,
+  humanPause,
+  jitteredInterval,
   normalizeTags,
   readPageText,
   reportProgress,
   safeQueryAny,
   validateCommonMedia,
   validateScheduleWindow,
+  warmupUploadPage,
 } from './base.mjs';
 
 export const spec = Object.freeze({
@@ -45,6 +49,14 @@ const LOGIN_SELECTORS = [
   '.semi-modal-content input[placeholder*="手机号"]',
   '[class*="qrcode-login"]',
   'button.login-button',
+];
+
+const UPLOAD_DROPZONE_SELECTORS = [
+  '[class*="upload-btn"]',
+  '[class*="upload-drag"]',
+  '[class*="container-drag"]',
+  '.semi-upload-drag-area',
+  'div[class*="upload"]',
 ];
 
 const VIDEO_INPUT_SELECTORS = [
@@ -119,6 +131,10 @@ const VERIFICATION_MODAL_SELECTORS = [
   '.uc-ui-verify',
   '.captcha_verify_container',
   '#captcha_container',
+  '.secsdk-captcha-drag-wrapper',
+  '#captcha-verify-image',
+  'iframe[src*="verify"]',
+  'iframe[src*="captcha"]',
   '[class*="verify-dialog"]',
   '[class*="sms-verify"]',
   '[class*="phone-verify"]',
@@ -202,53 +218,47 @@ export function validate(payload) {
   };
 }
 
-function isDouyinLoginUrl(url) {
+function isDouyinLoginUrl(url, { inFlow = false } = {}) {
   if (typeof url !== 'string' || !url) return false;
   if (/passport\.douyin\.com|\/login(?:[/?#]|$)/i.test(url)) return true;
   // Unauthenticated creator-micro/content/upload redirects to root creator.douyin.com/
-  return /^https?:\/\/creator\.douyin\.com\/?(?:[?#].*)?$/i.test(url);
+  if (/^https?:\/\/creator\.douyin\.com\/?(?:[?#].*)?$/i.test(url)) return true;
+  // Mid-flow forced kickout bounces via creator.douyin.com/ into /creator-micro/home
+  if (inFlow && /\/creator-micro\/home(?:[/?#]|$)/i.test(url)) return true;
+  return false;
+}
+
+function checkDouyinGuard(page, { stage = 'flow', inFlow = false } = {}) {
+  return checkPageGuardState(page, {
+    platformName: spec.name,
+    stage,
+    inFlow,
+    isLoginUrl: (url) => isDouyinLoginUrl(url, { inFlow }),
+    loginSelectors: LOGIN_SELECTORS,
+    verificationSelectors: VERIFICATION_MODAL_SELECTORS,
+    extraLoginTextRegex: /我是创作者.*登录/,
+  });
 }
 
 export async function checkAuth(page) {
   await page.navigate(spec.uploadUrl, { timeoutMs: 30_000 });
   await humanDelay(600, 1100, page);
 
-  const currentUrl = (await page.url()) || '';
-  const pageText = await readPageText(page);
-
-  const verify = detectVerificationPrompt(pageText);
-  const verifyModal = await safeQueryAny(page, VERIFICATION_MODAL_SELECTORS);
-  if (verify.detected || (verifyModal.found && verifyModal.visible)) {
+  const guard = await checkDouyinGuard(page, { stage: 'check_auth', inFlow: false });
+  if (guard.blocked) {
     return {
       platform: spec.id,
       loggedIn: false,
-      status: 'needs_verification',
+      status: guard.status,
       handle: null,
       accountName: null,
-      url: currentUrl,
-      message: `抖音创作者平台触发安全验证（${verify.kind || 'modal'}），请先在浏览器完成验证`,
-      diagnostics: { verification: verify },
+      url: guard.url,
+      message: guard.message,
+      diagnostics: guard.diagnostics,
     };
   }
 
-  const loginDom = await safeQueryAny(page, LOGIN_SELECTORS);
-  if (
-    isDouyinLoginUrl(currentUrl) ||
-    (loginDom.found && loginDom.visible) ||
-    /扫码登录|验证码登录|我是创作者.*登录/.test(pageText)
-  ) {
-    return {
-      platform: spec.id,
-      loggedIn: false,
-      status: 'needs_login',
-      handle: null,
-      accountName: null,
-      url: currentUrl,
-      message: '抖音创作者平台未登录，请先调用 open_login 扫码登录',
-      diagnostics: { loginSelector: loginDom.selector },
-    };
-  }
-
+  const currentUrl = guard.url || (await page.url()) || '';
   const uploadDom = await safeQueryAny(page, [...VIDEO_INPUT_SELECTORS, ...TITLE_SELECTORS]);
   const accountName = await extractAccountName(page);
   const loggedIn = currentUrl.includes('creator.douyin.com/creator-micro') && (uploadDom.found || Boolean(accountName));
@@ -308,30 +318,20 @@ async function extractAccountName(page) {
   }
 }
 
-async function detectDouyinVerification(page) {
-  const pageText = await readPageText(page);
-  const textCheck = detectVerificationPrompt(pageText);
-  if (textCheck.detected) {
-    return { detected: true, kind: textCheck.kind, matched: textCheck.matched };
-  }
-  const modal = await safeQueryAny(page, VERIFICATION_MODAL_SELECTORS);
-  if (modal.found && modal.visible) {
-    return { detected: true, kind: 'captcha', matched: modal.selector };
-  }
-  return { detected: false, kind: null, matched: null };
-}
-
 async function waitForEditorAndTranscode(page, ctx, diagnostics) {
   const timeoutMs = ctx.options?.uploadTimeoutMs ?? 180_000;
-  const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1500;
+  const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1800;
   const deadline = Date.now() + timeoutMs;
 
   let iteration = 0;
   while (iteration === 0 || Date.now() < deadline) {
     iteration += 1;
-    const verify = await detectDouyinVerification(page);
-    if (verify.detected) {
-      return { state: 'needs_verification', verify };
+
+    // Run risk-control & mid-flow forced-logout guard on EVERY SINGLE POLL ITERATION
+    const guard = await checkDouyinGuard(page, { stage: 'transcode', inFlow: true });
+    if (guard.blocked) {
+      diagnostics.uploadIterations = iteration;
+      return { state: 'guard_blocked', guard };
     }
 
     const pageText = await readPageText(page);
@@ -351,7 +351,7 @@ async function waitForEditorAndTranscode(page, ctx, diagnostics) {
     }
 
     if (Date.now() >= deadline) break;
-    await page.sleep(pollIntervalMs);
+    await page.sleep(jitteredInterval(pollIntervalMs));
   }
 
   return { state: 'timeout', reason: '等待抖音视频上传与转码完成超时' };
@@ -379,51 +379,23 @@ export async function publishVideo(page, ctx) {
     await page.navigate(spec.uploadUrl, { timeoutMs: 30_000 });
     await humanDelay(600, 1200, page);
 
-    const currentUrl = (await page.url()) || '';
-    const initialVerify = await detectDouyinVerification(page);
-    if (initialVerify.detected) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: currentUrl,
-        screenshotPath,
-        message: `抖音触发短信/滑块安全验证（${initialVerify.kind}），请先在浏览器完成验证`,
-        diagnostics: { ...diagnostics, verification: initialVerify },
-      });
+    const postNavGuard = await checkDouyinGuard(page, { stage: 'post_navigate', inFlow: false });
+    if (postNavGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, postNavGuard, diagnostics);
     }
 
-    const initialText = await readPageText(page);
-    const loginDom = await safeQueryAny(page, LOGIN_SELECTORS);
-    if (isDouyinLoginUrl(currentUrl) || (loginDom.found && loginDom.visible) || /扫码登录|验证码登录/.test(initialText)) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'needs_login', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_login',
-        url: currentUrl,
-        screenshotPath,
-        message: '抖音创作者平台未登录，请先登录后重试',
-        diagnostics,
-      });
-    }
+    // Natural page warmup (1.8–3.5s dwell + cursor drift + dropzone hover) before attaching file
+    await warmupUploadPage(page, UPLOAD_DROPZONE_SELECTORS);
 
     reportProgress(ctx, spec.id, 'upload', '正在上传视频到抖音');
     const fileRes = await page.setFiles(VIDEO_INPUT_SELECTORS, [ctx.videoPath]);
     diagnostics.steps.push({ step: 'upload_file', selector: fileRes?.selector || null });
-    await humanDelay(600, 1200, page);
+    await humanPause(page, 900, 1800);
 
     reportProgress(ctx, spec.id, 'transcode', '正在等待抖音发布表单与视频转码就绪');
     const uploadState = await waitForEditorAndTranscode(page, ctx, diagnostics);
-    if (uploadState.state === 'needs_verification') {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: await page.url(),
-        screenshotPath,
-        message: '抖音在视频上传阶段弹出短信/滑块验证，请在浏览器完成验证后继续',
-        diagnostics: { ...diagnostics, verification: uploadState.verify },
-      });
+    if (uploadState.state === 'guard_blocked') {
+      return buildGuardAbortResult(page, ctx, spec, uploadState.guard, diagnostics);
     }
     if (uploadState.state !== 'ready') {
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'upload_failed', diagnostics);
@@ -437,49 +409,69 @@ export async function publishVideo(page, ctx) {
       });
     }
 
+    // Pre-fill guard check + natural reading transition pause
+    const preFillGuard = await checkDouyinGuard(page, { stage: 'pre_fill', inFlow: true });
+    if (preFillGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, preFillGuard, diagnostics);
+    }
+    await humanPause(page, 900, 2000);
+
     // Fill title (<= 30 chars)
     if (adapted.title) {
       reportProgress(ctx, spec.id, 'fill_title', '正在填写抖音作品标题');
       await page.fillText(TITLE_SELECTORS, adapted.title, { clear: true, humanJitter: true });
       diagnostics.steps.push({ step: 'fill_title', length: Array.from(adapted.title).length });
-      await humanDelay(250, 600, page);
+      await humanPause(page, 900, 2000);
     }
 
     // Fill description
     if (adapted.description) {
+      const preDescGuard = await checkDouyinGuard(page, { stage: 'pre_fill_description', inFlow: true });
+      if (preDescGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, preDescGuard, diagnostics);
+      }
       reportProgress(ctx, spec.id, 'fill_description', '正在填写抖音作品简介');
       await page.fillText(DESC_SELECTORS, adapted.description, { clear: true, humanJitter: true });
       diagnostics.steps.push({ step: 'fill_description', length: Array.from(adapted.description).length });
-      await humanDelay(250, 600, page);
+      await humanPause(page, 1100, 2400);
     }
 
     // Fill #tags (<= 5)
     if (adapted.tags.length > 0) {
+      const preTagsGuard = await checkDouyinGuard(page, { stage: 'pre_fill_tags', inFlow: true });
+      if (preTagsGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, preTagsGuard, diagnostics);
+      }
       reportProgress(ctx, spec.id, 'fill_tags', `正在添加 ${adapted.tags.length} 个抖音话题标签`);
       for (const tag of adapted.tags) {
         await page.typeTag(DESC_SELECTORS, tag, {
           suggestionSelectors: TAG_SUGGESTION_SELECTORS,
           commitKey: 'Enter',
         });
-        await humanDelay(250, 550, page);
+        await humanPause(page, 450, 950);
       }
       diagnostics.steps.push({ step: 'fill_tags', count: adapted.tags.length });
+      await humanPause(page, 900, 1800);
     }
 
     // Optional cover upload (选择封面 -> 上传封面)
     if (adapted.coverPath) {
+      const preCoverGuard = await checkDouyinGuard(page, { stage: 'pre_upload_cover', inFlow: true });
+      if (preCoverGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, preCoverGuard, diagnostics);
+      }
       reportProgress(ctx, spec.id, 'upload_cover', '正在上传抖音自定义封面');
       const openCover = await clickWithTextFallback(page, COVER_TRIGGER_SELECTORS, ['选择封面', '设置封面', '编辑封面'], {
         timeoutMs: 3000,
       });
       if (openCover.clicked) {
-        await humanDelay(400, 800, page);
+        await humanPause(page, 500, 1000);
         await clickWithTextFallback(page, COVER_UPLOAD_TAB_SELECTORS, ['上传封面', '本地上传'], { timeoutMs: 2500 });
-        await humanDelay(250, 500, page);
+        await humanPause(page, 400, 800);
         await page.setFiles(COVER_INPUT_SELECTORS, [adapted.coverPath]);
-        await humanDelay(800, 1400, page);
+        await humanPause(page, 1000, 1800);
         await clickWithTextFallback(page, COVER_CONFIRM_SELECTORS, ['完成', '确定'], { timeoutMs: 3000, exact: true });
-        await humanDelay(400, 800, page);
+        await humanPause(page, 900, 1800);
         diagnostics.steps.push({ step: 'upload_cover', applied: true });
       } else {
         diagnostics.steps.push({ step: 'upload_cover', applied: false, reason: 'cover_button_not_found' });
@@ -492,7 +484,7 @@ export async function publishVideo(page, ctx) {
         timeoutMs: 2500,
       });
       diagnostics.steps.push({ step: 'ai_generated_flag', applied: aiClick.clicked });
-      await humanDelay(200, 450, page);
+      await humanPause(page, 500, 1000);
     }
 
     // Optional visibility
@@ -501,7 +493,7 @@ export async function publishVideo(page, ctx) {
         timeoutMs: 2500,
       });
       diagnostics.steps.push({ step: 'visibility', target: adapted.options.visibility, applied: visClick.clicked });
-      await humanDelay(200, 450, page);
+      await humanPause(page, 500, 1000);
     }
 
     // Optional schedule (定时发布)
@@ -512,30 +504,23 @@ export async function publishVideo(page, ctx) {
         const schedClick = await clickWithTextFallback(page, ['input[value="2"]', '[class*="schedule"]'], ['定时发布'], {
           timeoutMs: 3000,
         });
-        await humanDelay(300, 600, page);
+        await humanPause(page, 500, 1000);
         if (schedClick.clicked) {
           await page.fillText(SCHEDULE_INPUT_SELECTORS, localSched.dateTime, { clear: true, humanJitter: false });
           await page.pressKey('Enter');
           diagnostics.steps.push({ step: 'schedule', dateTime: localSched.dateTime, applied: true });
-          await humanDelay(300, 600, page);
+          await humanPause(page, 600, 1200);
         } else {
           diagnostics.steps.push({ step: 'schedule', dateTime: localSched.dateTime, applied: false });
         }
       }
     }
 
-    // Explicit verification check before final action
-    const preVerify = await detectDouyinVerification(page);
-    if (preVerify.detected) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: await page.url(),
-        screenshotPath,
-        message: `抖音弹出短信/滑块安全验证（${preVerify.kind}），请在浏览器中完成验证`,
-        diagnostics: { ...diagnostics, verification: preVerify },
-      });
+    // Natural pre-submit pause (1.5–3.0s) & explicit guard check before Draft/Publish
+    await humanPause(page, 1500, 3000);
+    const preSubmitGuard = await checkDouyinGuard(page, { stage: 'pre_submit', inFlow: true });
+    if (preSubmitGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, preSubmitGuard, diagnostics);
     }
 
     // Draft mode
@@ -545,11 +530,16 @@ export async function publishVideo(page, ctx) {
         timeoutMs: 3000,
       });
       if (draftClick.clicked) {
-        await humanDelay(800, 1400, page);
+        await humanPause(page, 900, 1600);
+        const postDraftGuard = await checkDouyinGuard(page, { stage: 'post_draft', inFlow: true });
+        if (postDraftGuard.blocked) {
+          return buildGuardAbortResult(page, ctx, spec, postDraftGuard, diagnostics);
+        }
         diagnostics.draftMethod = 'button_click';
         diagnostics.draftSelector = draftClick.selector;
       } else {
         diagnostics.draftMethod = 'form_populated';
+        diagnostics.keepTabOpen = true;
       }
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'draft_saved', diagnostics);
       return buildResult({
@@ -559,7 +549,7 @@ export async function publishVideo(page, ctx) {
         screenshotPath,
         message: draftClick.clicked
           ? '抖音视频已保存至草稿箱'
-          : '抖音视频与文案已填充完成（未点击草稿按钮，页面保持待审核状态）',
+          : '抖音视频与文案已填充完成（未点击草稿按钮，已保留当前标签页以便人工确认）',
         diagnostics,
       });
     }
@@ -571,20 +561,21 @@ export async function publishVideo(page, ctx) {
       exact: true,
     });
     if (!publishClick.clicked) {
+      diagnostics.keepTabOpen = true;
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'publish_btn_missing', diagnostics);
       return buildResult({
         platform: spec.id,
         status: 'failed',
         url: await page.url(),
         screenshotPath,
-        message: '未找到抖音发布按钮，已保留表单内容',
+        message: '未找到抖音发布按钮，已保留表单内容与当前标签页',
         diagnostics,
       });
     }
     diagnostics.steps.push({ step: 'click_publish', selector: publishClick.selector });
 
     const publishTimeoutMs = ctx.options?.publishTimeoutMs ?? 20_000;
-    const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1000;
+    const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1200;
     const deadline = Date.now() + publishTimeoutMs;
     let publishedConfirmed = false;
     let finalUrl = (await page.url()) || '';
@@ -592,21 +583,13 @@ export async function publishVideo(page, ctx) {
     let iter = 0;
     while (iter === 0 || Date.now() < deadline) {
       iter += 1;
-      await page.sleep(pollIntervalMs);
+      await page.sleep(jitteredInterval(pollIntervalMs));
       finalUrl = (await page.url()) || '';
 
-      // Immediately detect Douyin's post-click SMS / captcha / slider modal
-      const postVerify = await detectDouyinVerification(page);
-      if (postVerify.detected) {
-        const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-        return buildResult({
-          platform: spec.id,
-          status: 'needs_verification',
-          url: finalUrl,
-          screenshotPath,
-          message: `点击发布后抖音弹出安全验证（${postVerify.kind}），请在浏览器中完成短信或滑块验证`,
-          diagnostics: { ...diagnostics, verification: postVerify },
-        });
+      // Immediately detect Douyin's post-click SMS / captcha / slider / forced logout
+      const postGuard = await checkDouyinGuard(page, { stage: 'post_submit', inFlow: true });
+      if (postGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, postGuard, diagnostics);
       }
 
       const afterText = await readPageText(page);
@@ -630,6 +613,7 @@ export async function publishVideo(page, ctx) {
     );
 
     if (!publishedConfirmed) {
+      diagnostics.keepTabOpen = true;
       return buildResult({
         platform: spec.id,
         status: 'failed',

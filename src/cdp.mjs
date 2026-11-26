@@ -8,17 +8,54 @@ import {
   redactSensitiveText,
   resolveProfileDir,
 } from './constants.mjs';
+import {
+  buildBezierPath,
+  buildTypingPlan,
+  buildWheelChunks,
+  humanSleep,
+  jitterDelay,
+  randInt,
+  sampleInteriorPoint,
+} from './human.mjs';
 
 const HTTP_PROBE_TIMEOUT_MS = 2_500;
 const CDP_CMD_TIMEOUT_MS = 30_000;
 const CHROME_LAUNCH_TIMEOUT_MS = 15_000;
 
+/**
+ * Prototype-only stealth cleanup: runs ONLY when `navigator.webdriver === true`
+ * and patches `Navigator.prototype` rather than defining a suspicious own
+ * property directly on `navigator`.
+ */
+export const WEBDRIVER_STEALTH_SCRIPT = `(() => {
+  try {
+    if (navigator.webdriver !== true) return;
+    const proto = Object.getPrototypeOf(navigator);
+    if (!proto) return;
+    if (Object.prototype.hasOwnProperty.call(proto, 'webdriver')) {
+      try { delete proto.webdriver; } catch (_) {}
+      if (navigator.webdriver === true) {
+        Object.defineProperty(proto, 'webdriver', {
+          get: () => undefined,
+          configurable: true,
+        });
+      }
+    }
+  } catch (_) {}
+})();`;
+
 const KEY_DEFS = Object.freeze({
   Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
+  '\n': { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
   Tab: { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 },
+  '\t': { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 },
   Escape: { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 },
   Backspace: { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 },
   Delete: { key: 'Delete', code: 'Delete', windowsVirtualKeyCode: 46 },
+  End: { key: 'End', code: 'End', windowsVirtualKeyCode: 35 },
+  Home: { key: 'Home', code: 'Home', windowsVirtualKeyCode: 36 },
+  PageUp: { key: 'PageUp', code: 'PageUp', windowsVirtualKeyCode: 33 },
+  PageDown: { key: 'PageDown', code: 'PageDown', windowsVirtualKeyCode: 34 },
   ArrowDown: { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40 },
   ArrowUp: { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38 },
   ArrowLeft: { key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37 },
@@ -27,18 +64,133 @@ const KEY_DEFS = Object.freeze({
   ' ': { key: ' ', code: 'Space', windowsVirtualKeyCode: 32, text: ' ' },
 });
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+const ASCII_SYMBOL_MAP = Object.freeze({
+  '!': { code: 'Digit1', vk: 49, shift: true },
+  '@': { code: 'Digit2', vk: 50, shift: true },
+  '#': { code: 'Digit3', vk: 51, shift: true },
+  '$': { code: 'Digit4', vk: 52, shift: true },
+  '%': { code: 'Digit5', vk: 53, shift: true },
+  '^': { code: 'Digit6', vk: 54, shift: true },
+  '&': { code: 'Digit7', vk: 55, shift: true },
+  '*': { code: 'Digit8', vk: 56, shift: true },
+  '(': { code: 'Digit9', vk: 57, shift: true },
+  ')': { code: 'Digit0', vk: 48, shift: true },
+  '-': { code: 'Minus', vk: 189, shift: false },
+  '_': { code: 'Minus', vk: 189, shift: true },
+  '=': { code: 'Equal', vk: 187, shift: false },
+  '+': { code: 'Equal', vk: 187, shift: true },
+  '[': { code: 'BracketLeft', vk: 219, shift: false },
+  '{': { code: 'BracketLeft', vk: 219, shift: true },
+  ']': { code: 'BracketRight', vk: 221, shift: false },
+  '}': { code: 'BracketRight', vk: 221, shift: true },
+  '\\': { code: 'Backslash', vk: 220, shift: false },
+  '|': { code: 'Backslash', vk: 220, shift: true },
+  ';': { code: 'Semicolon', vk: 186, shift: false },
+  ':': { code: 'Semicolon', vk: 186, shift: true },
+  '\'': { code: 'Quote', vk: 222, shift: false },
+  '"': { code: 'Quote', vk: 222, shift: true },
+  ',': { code: 'Comma', vk: 188, shift: false },
+  '<': { code: 'Comma', vk: 188, shift: true },
+  '.': { code: 'Period', vk: 190, shift: false },
+  '>': { code: 'Period', vk: 190, shift: true },
+  '/': { code: 'Slash', vk: 191, shift: false },
+  '?': { code: 'Slash', vk: 191, shift: true },
+  '`': { code: 'Backquote', vk: 192, shift: false },
+  '~': { code: 'Backquote', vk: 192, shift: true },
+});
+
+function describeKey(rawKey, explicitModifiers = 0) {
+  const key = String(rawKey || '');
+  if (KEY_DEFS[key]) {
+    return { ...KEY_DEFS[key], modifiers: explicitModifiers };
+  }
+  if (key.length === 1) {
+    const codePoint = key.charCodeAt(0);
+    if (codePoint >= 97 && codePoint <= 122) {
+      // a-z
+      const upper = key.toUpperCase();
+      return {
+        key,
+        code: `Key${upper}`,
+        windowsVirtualKeyCode: upper.charCodeAt(0),
+        text: key,
+        modifiers: explicitModifiers,
+      };
+    }
+    if (codePoint >= 65 && codePoint <= 90) {
+      // A-Z
+      return {
+        key,
+        code: `Key${key}`,
+        windowsVirtualKeyCode: codePoint,
+        text: key,
+        modifiers: explicitModifiers | 8, // Shift = 8
+      };
+    }
+    if (codePoint >= 48 && codePoint <= 57) {
+      // 0-9
+      return {
+        key,
+        code: `Digit${key}`,
+        windowsVirtualKeyCode: codePoint,
+        text: key,
+        modifiers: explicitModifiers,
+      };
+    }
+    const sym = ASCII_SYMBOL_MAP[key];
+    if (sym) {
+      return {
+        key,
+        code: sym.code,
+        windowsVirtualKeyCode: sym.vk,
+        text: key,
+        modifiers: explicitModifiers | (sym.shift ? 8 : 0),
+      };
+    }
+    return {
+      key,
+      code: '',
+      windowsVirtualKeyCode: codePoint,
+      text: key,
+      modifiers: explicitModifiers,
+    };
+  }
+  return {
+    key,
+    code: key,
+    windowsVirtualKeyCode: 0,
+    modifiers: explicitModifiers,
+  };
 }
 
-function randomInt(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
 function normalizeSelectors(selectors) {
   if (Array.isArray(selectors)) return selectors.map((s) => String(s || '').trim()).filter(Boolean);
   const one = String(selectors || '').trim();
   return one ? [one] : [];
+}
+
+/**
+ * Builds Chrome launch arguments for the dedicated persistent profile.
+ * Keeps `--disable-blink-features=AutomationControlled`, avoids deprecated
+ * automation flags, and uses a realistic `1440,900` window size.
+ *
+ * @param {{ profileDir: string }} opts
+ * @returns {string[]}
+ */
+export function buildLaunchArgs({ profileDir }) {
+  return [
+    `--user-data-dir=${profileDir}`,
+    '--remote-debugging-port=0',
+    '--disable-blink-features=AutomationControlled',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--window-size=1440,900',
+    'about:blank',
+  ];
 }
 
 /**
@@ -282,16 +434,7 @@ export async function launchBrowserWithCdp({ profileDir, env = process.env, plat
     // ignore
   }
 
-  const args = [
-    `--user-data-dir=${resolvedProfile}`,
-    '--remote-debugging-port=0',
-    '--disable-blink-features=AutomationControlled',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--disable-infobars',
-    '--window-size=1366,900',
-    'about:blank',
-  ];
+  const args = buildLaunchArgs({ profileDir: resolvedProfile });
 
   const child = spawn(binary, args, {
     detached: true,
@@ -444,6 +587,7 @@ export class CdpClient {
 
 /**
  * In-page multi-strategy element finder injected via Runtime.evaluate.
+ * Strictly read-only (zero DOM mutations, zero window globals).
  * Supports:
  * - Standard CSS selectors
  * - `text=...` substring/exact text matching
@@ -568,11 +712,54 @@ function __svFindElement(selectors, preferVisible) {
 `;
 
 export class CdpPage {
-  constructor(client, { sessionId, targetId }) {
+  constructor(client, { sessionId, targetId, fastMode = false, rng = Math.random }) {
     this.client = client;
     this.sessionId = sessionId;
     this.targetId = targetId;
     this.initialized = false;
+    this.fastMode = Boolean(fastMode);
+    this.rng = typeof rng === 'function' ? rng : Math.random;
+    this.cursorX = null;
+    this.cursorY = null;
+  }
+
+  _humanOpts() {
+    return { fastMode: this.fastMode, rng: this.rng };
+  }
+
+  _humanSleep(ms) {
+    return humanSleep(ms, { fastMode: this.fastMode });
+  }
+
+  _ensureCursorInitialized() {
+    if (this.cursorX === null || this.cursorY === null) {
+      this.cursorX = randInt(220, 580, this.rng);
+      this.cursorY = randInt(140, 320, this.rng);
+    }
+  }
+
+  async _bringToFront() {
+    try {
+      await this.send('Page.bringToFront');
+    } catch {
+      // Non-fatal on restricted targets or minimal mock clients.
+    }
+  }
+
+  async _getViewportInfo() {
+    try {
+      const info = await this.evaluate(() => ({
+        width: window.innerWidth || 1440,
+        height: window.innerHeight || 900,
+        scrollY: window.scrollY || window.pageYOffset || 0,
+      }));
+      if (info && Number.isFinite(info.width) && Number.isFinite(info.height)) {
+        return info;
+      }
+    } catch {
+      // Fall back to default viewport size.
+    }
+    return { width: 1440, height: 900, scrollY: 0 };
   }
 
   async ensureInitialized() {
@@ -581,10 +768,10 @@ export class CdpPage {
     await this.send('Runtime.enable');
     await this.send('DOM.enable');
     await this.send('Network.enable');
-    // Subtle anti-automation property cleanup on new documents.
+    // Prototype-only stealth cleanup; only touches Navigator.prototype if webdriver === true.
     try {
       await this.send('Page.addScriptToEvaluateOnNewDocument', {
-        source: `Object.defineProperty(navigator, 'webdriver', { get: () => undefined });`,
+        source: WEBDRIVER_STEALTH_SCRIPT,
       });
     } catch {
       // Non-fatal if restricted.
@@ -597,13 +784,16 @@ export class CdpPage {
   }
 
   async sleep(ms) {
-    return sleep(ms);
+    return this._humanSleep(ms);
   }
 
   async navigate(url, { timeoutMs = 45_000 } = {}) {
     await this.ensureInitialized();
     const targetUrl = String(url || '').trim();
     if (!targetUrl) throw new Error('navigate 需要有效的 URL');
+
+    // Initialize realistic starting pointer position on first navigation.
+    this._ensureCursorInitialized();
 
     let resolveLoad;
     const loadPromise = new Promise((resolve) => { resolveLoad = resolve; });
@@ -622,7 +812,7 @@ export class CdpPage {
         sleep(Math.min(timeoutMs, 15_000)),
       ]);
       // Brief settle for SPA hydration
-      await sleep(randomInt(400, 750));
+      await this._humanSleep(randInt(450, 850, this.rng));
       return { url: await this.url() };
     } finally {
       offLoad();
@@ -682,9 +872,275 @@ export class CdpPage {
       if (hit && hit.found && (!visible || hit.visible)) {
         return { ...hit, found: true };
       }
-      await sleep(pollMs);
+      await this._humanSleep(jitterDelay(pollMs, 0.25, this.rng));
     }
     throw new Error(`等待页面元素超时（${timeoutMs}ms）：${list.join(' | ')}`);
+  }
+
+  /**
+   * Moves the pointer along a cubic Bezier trajectory with minimum-jerk easing,
+   * decaying micro-jitter, and occasional subtle overshoot on long moves.
+   *
+   * @param {number} tx
+   * @param {number} ty
+   * @returns {Promise<{ x: number, y: number, steps: number }>}
+   */
+  async moveMouseTo(tx, ty) {
+    await this.ensureInitialized();
+    this._ensureCursorInitialized();
+    const targetX = Math.max(0, Math.round(Number(tx) || 0));
+    const targetY = Math.max(0, Math.round(Number(ty) || 0));
+
+    const pathPoints = buildBezierPath(
+      { x: this.cursorX, y: this.cursorY },
+      { x: targetX, y: targetY },
+      { rng: this.rng },
+    );
+
+    for (const pt of pathPoints) {
+      await this.send('Input.dispatchMouseEvent', {
+        type: 'mouseMoved',
+        x: pt.x,
+        y: pt.y,
+        pointerType: 'mouse',
+      });
+      this.cursorX = pt.x;
+      this.cursorY = pt.y;
+      await this._humanSleep(pt.delayMs);
+    }
+
+    return { x: this.cursorX, y: this.cursorY, steps: pathPoints.length };
+  }
+
+  /**
+   * Smoothly scrolls the viewport using variable `mouseWheel` chunks so a target
+   * rect sits comfortably within [15%, 80%] of viewport height.
+   * Returns `{ scrolled, deltaScrollY }`.
+   */
+  async _smoothScrollRectIntoView(rect) {
+    const vp = await this._getViewportInfo();
+    const top = Number.isFinite(rect?.top) ? rect.top : (Number.isFinite(rect?.y) ? rect.y : 0);
+    const height = Math.max(1, Number(rect?.height) || 1);
+    const centerY = top + height / 2;
+    const minBand = vp.height * 0.15;
+    const maxBand = vp.height * 0.80;
+
+    if (centerY >= minBand && centerY <= maxBand) {
+      return { scrolled: false, deltaScrollY: 0 };
+    }
+
+    const desiredCenterY = vp.height * 0.45;
+    const neededDeltaY = Math.round(centerY - desiredCenterY);
+    if (Math.abs(neededDeltaY) < 10) {
+      return { scrolled: false, deltaScrollY: 0 };
+    }
+
+    this._ensureCursorInitialized();
+    const wheelX = Math.max(40, Math.min(vp.width - 40, Math.round(this.cursorX)));
+    const wheelY = Math.max(40, Math.min(vp.height - 40, Math.round(this.cursorY)));
+
+    const chunks = buildWheelChunks(neededDeltaY, { rng: this.rng });
+    for (const chunk of chunks) {
+      await this.send('Input.dispatchMouseEvent', {
+        type: 'mouseWheel',
+        x: wheelX,
+        y: wheelY,
+        deltaX: 0,
+        deltaY: chunk.deltaY,
+      });
+      await this._humanSleep(chunk.delayMs);
+    }
+
+    const after = await this._getViewportInfo();
+    const deltaScrollY = (after.scrollY || 0) - (vp.scrollY || 0);
+    return { scrolled: true, deltaScrollY };
+  }
+
+  /**
+   * Read-only element rect resolver (zero DOM mutation, zero `scrollIntoView`).
+   */
+  async _resolveElementRect(selectors, { preferVisible = true } = {}) {
+    const list = normalizeSelectors(selectors);
+    const expr = `(() => {
+      ${IN_PAGE_FINDER_SOURCE}
+      const hit = __svFindElement(${JSON.stringify(list)}, ${Boolean(preferVisible)});
+      if (!hit) return null;
+      const el = hit.el;
+      const rect = el.getBoundingClientRect();
+      return {
+        selector: hit.selector,
+        visible: hit.visible,
+        disabled: hit.disabled,
+        left: hit.offsetX + rect.left,
+        top: hit.offsetY + rect.top,
+        x: hit.offsetX + rect.left,
+        y: hit.offsetY + rect.top,
+        width: rect.width,
+        height: rect.height,
+        tagName: (el.tagName || '').toLowerCase(),
+        isContentEditable: Boolean(el.isContentEditable),
+      };
+    })()`;
+    return this.evaluate(expr);
+  }
+
+  /**
+   * Scrolls a selector's matched element smoothly into [15%, 80%] of viewport via
+   * real `mouseWheel` chunks, falling back to `scrollIntoView({ behavior: 'smooth' })`
+   * ONLY when wheel events do not move a nested scroll container.
+   */
+  async scrollElementIntoView(selectors, initialInfo = null) {
+    const list = normalizeSelectors(selectors);
+    let info = initialInfo || await this._resolveElementRect(list, { preferVisible: true });
+    if (!info) return null;
+
+    const wheelRes = await this._smoothScrollRectIntoView(info);
+    if (!wheelRes.scrolled) return info;
+
+    let refreshed = await this._resolveElementRect([info.selector], { preferVisible: true }) || info;
+    const vp = await this._getViewportInfo();
+    const centerY = refreshed.top + refreshed.height / 2;
+    const stillOutOfBand = centerY < vp.height * 0.15 || centerY > vp.height * 0.80;
+
+    // Fallback for nested scrollable containers where window wheel did not scroll target.
+    if (stillOutOfBand && Math.abs(wheelRes.deltaScrollY) < 5) {
+      await this.evaluate(
+        `(() => {
+          ${IN_PAGE_FINDER_SOURCE}
+          const hit = __svFindElement(${JSON.stringify([info.selector])}, true);
+          if (hit && hit.el && typeof hit.el.scrollIntoView === 'function') {
+            try { hit.el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' }); } catch (_) {}
+          }
+        })()`,
+      );
+      await this._humanSleep(randInt(260, 440, this.rng));
+      refreshed = await this._resolveElementRect([info.selector], { preferVisible: true }) || refreshed;
+    }
+
+    return refreshed;
+  }
+
+  /**
+   * Humanized click on a viewport bounding rect (`{ left, top, width, height }`
+   * or `{ x, y, width, height }`):
+   * - brings tab to front (`Page.bringToFront`)
+   * - smooth-scrolls if outside [15%, 80%] of viewport
+   * - samples natural interior point inside [22%, 78%] via Irwin-Hall
+   * - moves pointer via cubic Bezier (`moveMouseTo`)
+   * - hovers 90–260ms, holds click 55–140ms, settles 120–280ms
+   *
+   * Zero DOM mutation.
+   */
+  async clickPoint(rect, { settle = true } = {}) {
+    await this.ensureInitialized();
+
+    const originX = Number.isFinite(rect?.left) ? rect.left : (Number.isFinite(rect?.x) ? rect.x : NaN);
+    const originY = Number.isFinite(rect?.top) ? rect.top : (Number.isFinite(rect?.y) ? rect.y : NaN);
+    const width = Number(rect?.width);
+    const height = Number(rect?.height);
+    if (!rect || !Number.isFinite(originX) || !Number.isFinite(originY) || !(width > 0) || !(height > 0)) {
+      throw new Error(`clickPoint 收到无效或零尺寸矩形：${JSON.stringify(rect ?? null)}`);
+    }
+
+    await this._bringToFront();
+
+    let effectiveTop = originY;
+    const scrollRes = await this._smoothScrollRectIntoView({
+      left: originX,
+      top: originY,
+      width,
+      height,
+    });
+    if (scrollRes.scrolled && scrollRes.deltaScrollY) {
+      effectiveTop = originY - scrollRes.deltaScrollY;
+    }
+
+    const pt = sampleInteriorPoint(
+      { left: originX, top: effectiveTop, width, height },
+      { rng: this.rng },
+    );
+    const x = Math.max(1, Math.round(pt.x));
+    const y = Math.max(1, Math.round(pt.y));
+
+    await this.moveMouseTo(x, y);
+    await this._humanSleep(randInt(90, 260, this.rng));
+
+    await this.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x,
+      y,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+      pointerType: 'mouse',
+    });
+    await this._humanSleep(randInt(55, 140, this.rng));
+    await this.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x,
+      y,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+      pointerType: 'mouse',
+    });
+
+    if (settle) {
+      await this._humanSleep(randInt(120, 280, this.rng));
+    }
+
+    return { x, y };
+  }
+
+  /**
+   * Finds a visible element without mutating DOM, moves the cursor smoothly to a
+   * natural interior point, and dwells `dwellMs` (default 250–600ms).
+   * Gracefully returns `{ found: false }` when no matching visible element exists.
+   */
+  async hoverAny(selectors, { dwellMs } = {}) {
+    await this.ensureInitialized();
+    const list = normalizeSelectors(selectors);
+    if (!list.length) return { found: false, selector: null };
+
+    const info = await this._resolveElementRect(list, { preferVisible: true });
+    if (!info || !info.visible || info.width <= 0 || info.height <= 0) {
+      return { found: false, selector: null };
+    }
+
+    await this._bringToFront();
+    const inView = await this.scrollElementIntoView([info.selector], info) || info;
+    const pt = sampleInteriorPoint(inView, { rng: this.rng });
+    await this.moveMouseTo(pt.x, pt.y);
+
+    const dwell = Number.isFinite(dwellMs) ? Math.max(0, dwellMs) : randInt(250, 600, this.rng);
+    await this._humanSleep(dwell);
+
+    return { found: true, selector: inView.selector, x: pt.x, y: pt.y };
+  }
+
+  /**
+   * Performs 1–2 subtle natural cursor drifts within the visible viewport.
+   */
+  async idleDrift({ steps = 1 } = {}) {
+    await this.ensureInitialized();
+    this._ensureCursorInitialized();
+    const vp = await this._getViewportInfo();
+    const count = Math.max(1, Math.min(3, Math.round(Number(steps) || 1)));
+    const marginX = Math.min(100, Math.round(vp.width * 0.08));
+    const marginY = Math.min(100, Math.round(vp.height * 0.10));
+
+    for (let i = 0; i < count; i += 1) {
+      const dx = (this.rng() < 0.5 ? -1 : 1) * randInt(45, 220, this.rng);
+      const dy = (this.rng() < 0.5 ? -1 : 1) * randInt(30, 160, this.rng);
+      const tx = Math.max(marginX, Math.min(vp.width - marginX, this.cursorX + dx));
+      const ty = Math.max(marginY, Math.min(vp.height - marginY, this.cursorY + dy));
+      await this.moveMouseTo(tx, ty);
+      if (i < count - 1) {
+        await this._humanSleep(randInt(140, 340, this.rng));
+      }
+    }
+
+    return { x: this.cursorX, y: this.cursorY, steps: count };
   }
 
   async setFiles(selectors, filePaths, { timeoutMs = 15_000 } = {}) {
@@ -699,199 +1155,191 @@ export class CdpPage {
     }
 
     const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 15_000);
-    let lastMatchedSelector = null;
 
     while (Date.now() < deadline) {
-      // Ensure DOM tree is tracked before requestNode.
-      await this.send('DOM.getDocument', { depth: -1, pierce: true });
-
-      const evalRes = await this.send('Runtime.evaluate', {
-        expression: `(() => {
+      // Step 1: Lightweight read-only existence check (NO DOM.getDocument flood, NO window globals!).
+      const probe = await this.evaluate(
+        `(() => {
           ${IN_PAGE_FINDER_SOURCE}
           const hit = __svFindElement(${JSON.stringify(list)}, false);
-          if (!hit) return null;
-          window.__svLastFileSelector = hit.selector;
-          return hit.el;
+          return hit ? { found: true, selector: hit.selector } : { found: false, selector: null };
         })()`,
-        returnByValue: false,
-      });
+      );
 
-      const objectId = evalRes?.result?.objectId;
-      if (objectId) {
-        try {
-          lastMatchedSelector = await this.evaluate(() => window.__svLastFileSelector || null);
-          const { nodeId } = await this.send('DOM.requestNode', { objectId });
-          if (nodeId) {
-            await this.send('DOM.setFileInputFiles', { nodeId, files });
-            return { selector: lastMatchedSelector || list[0] };
+      if (probe && probe.found && probe.selector) {
+        // Step 2: Only fetch DOM tree ONCE when the exact <input type="file"> is ready.
+        await this.send('DOM.getDocument', { depth: -1, pierce: true });
+
+        const evalRes = await this.send('Runtime.evaluate', {
+          expression: `(() => {
+            ${IN_PAGE_FINDER_SOURCE}
+            const hit = __svFindElement(${JSON.stringify([probe.selector])}, false);
+            return hit ? hit.el : null;
+          })()`,
+          returnByValue: false,
+        });
+
+        const objectId = evalRes?.result?.objectId;
+        if (objectId) {
+          try {
+            const { nodeId } = await this.send('DOM.requestNode', { objectId });
+            if (nodeId) {
+              await this.send('DOM.setFileInputFiles', { nodeId, files });
+              return { selector: probe.selector };
+            }
+          } finally {
+            try { await this.send('Runtime.releaseObject', { objectId }); } catch { /* ignore */ }
           }
-        } finally {
-          try { await this.send('Runtime.releaseObject', { objectId }); } catch { /* ignore */ }
         }
       }
-      await sleep(300);
+
+      await this._humanSleep(jitterDelay(300, 0.25, this.rng));
     }
 
     throw new Error(`未找到可上传的文件输入框（${timeoutMs}ms）：${list.join(' | ')}`);
   }
 
-  async _resolveClickPoint(selectors, { preferVisible = true } = {}) {
-    const list = normalizeSelectors(selectors);
-    const expr = `(() => {
-      ${IN_PAGE_FINDER_SOURCE}
-      const hit = __svFindElement(${JSON.stringify(list)}, ${Boolean(preferVisible)});
-      if (!hit) return null;
-      const el = hit.el;
-      try { el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' }); } catch (_) {}
-      const rect = el.getBoundingClientRect();
-      return {
-        selector: hit.selector,
-        visible: hit.visible,
-        disabled: hit.disabled,
-        x: hit.offsetX + rect.left + rect.width / 2,
-        y: hit.offsetY + rect.top + rect.height / 2,
-        width: rect.width,
-        height: rect.height,
-        tagName: (el.tagName || '').toLowerCase(),
-        isContentEditable: Boolean(el.isContentEditable),
-      };
-    })()`;
-    return this.evaluate(expr);
-  }
-
-  async clickAny(selectors, { timeoutMs = 15_000, humanJitter = true } = {}) {
+  async clickAny(selectors, { timeoutMs = 15_000 } = {}) {
     await this.ensureInitialized();
     const list = normalizeSelectors(selectors);
     const deadline = Date.now() + Math.max(500, Number(timeoutMs) || 15_000);
-    let point = null;
+    let info = null;
     while (Date.now() < deadline) {
-      point = await this._resolveClickPoint(list, { preferVisible: true });
-      if (point && point.visible && point.width > 0 && point.height > 0) break;
-      await sleep(250);
+      info = await this._resolveElementRect(list, { preferVisible: true });
+      if (info && info.visible && info.width > 0 && info.height > 0) break;
+      await this._humanSleep(jitterDelay(250, 0.25, this.rng));
     }
-    if (!point) {
+    if (!info || !info.visible || info.width <= 0 || info.height <= 0) {
       throw new Error(`点击失败，未找到元素（${timeoutMs}ms）：${list.join(' | ')}`);
     }
 
-    const jitterX = humanJitter ? randomInt(-2, 2) : 0;
-    const jitterY = humanJitter ? randomInt(-2, 2) : 0;
-    const x = Math.max(1, Math.round(point.x + jitterX));
-    const y = Math.max(1, Math.round(point.y + jitterY));
-
-    if (humanJitter) await sleep(randomInt(70, 180));
-    await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-    await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
-    await sleep(randomInt(25, 65));
-    await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
-
-    return { selector: point.selector };
+    const inView = await this.scrollElementIntoView([info.selector], info) || info;
+    await this.clickPoint(inView);
+    return { selector: inView.selector };
   }
 
-  async pressKey(key, modifiers = 0) {
+  async pressKey(key, modifiers = 0, { holdMs, commands } = {}) {
     await this.ensureInitialized();
-    const rawKey = String(key || '');
-    const def = KEY_DEFS[rawKey] || {
-      key: rawKey,
-      code: rawKey.length === 1 ? `Key${rawKey.toUpperCase()}` : rawKey,
-      windowsVirtualKeyCode: rawKey.length === 1 ? rawKey.toUpperCase().charCodeAt(0) : 0,
-      text: rawKey.length === 1 ? rawKey : undefined,
-    };
+    const def = describeKey(key, modifiers);
+    const effectiveModifiers = def.modifiers || 0;
+    const hasCommandModifier = Boolean(effectiveModifiers & (1 | 2 | 4)); // Alt=1, Ctrl=2, Meta=4
+    const keyHold = Number.isFinite(holdMs) ? Math.max(0, holdMs) : randInt(40, 105, this.rng);
+    const emitTextKeyDown = Boolean(def.text && !hasCommandModifier);
+    const validCommands = Array.isArray(commands) && commands.length > 0 ? commands : null;
 
+    // Use `keyDown` for printable/Enter keys so Blink respects `keydown` `preventDefault()`
+    // instead of firing an unconditional `char` event; keep `rawKeyDown` for command/non-text keys.
     await this.send('Input.dispatchKeyEvent', {
-      type: 'rawKeyDown',
+      type: emitTextKeyDown ? 'keyDown' : 'rawKeyDown',
       key: def.key,
       code: def.code,
       windowsVirtualKeyCode: def.windowsVirtualKeyCode,
       nativeVirtualKeyCode: def.windowsVirtualKeyCode,
-      modifiers,
-      ...(def.text ? { text: def.text, unmodifiedText: def.text } : {}),
+      modifiers: effectiveModifiers,
+      ...(emitTextKeyDown ? { text: def.text, unmodifiedText: def.text } : {}),
+      ...(validCommands ? { commands: validCommands } : {}),
     });
-    if (def.text && !modifiers) {
-      await this.send('Input.dispatchKeyEvent', {
-        type: 'char',
-        key: def.key,
-        code: def.code,
-        text: def.text,
-        unmodifiedText: def.text,
-        windowsVirtualKeyCode: def.windowsVirtualKeyCode,
-      });
-    }
+
+    await this._humanSleep(keyHold);
+
     await this.send('Input.dispatchKeyEvent', {
       type: 'keyUp',
       key: def.key,
       code: def.code,
       windowsVirtualKeyCode: def.windowsVirtualKeyCode,
       nativeVirtualKeyCode: def.windowsVirtualKeyCode,
-      modifiers,
+      modifiers: effectiveModifiers,
     });
   }
 
-  async fillText(selectors, text, { clear = true, humanJitter = true, timeoutMs = 15_000 } = {}) {
+  /**
+   * Executes a `buildTypingPlan(text)` sequence with real keystroke events for
+   * ASCII and small-chunk IME commits for CJK/emoji.
+   */
+  async _typeHumanText(text, { isContentEditable = false, tagName = '' } = {}) {
+    const normalizedInput = tagName === 'input'
+      ? String(text ?? '').replace(/\r\n?|\n/g, ' ')
+      : String(text ?? '');
+    const plan = buildTypingPlan(normalizedInput, { rng: this.rng });
+    for (const step of plan) {
+      if (step.kind === 'key') {
+        if (step.text === '\n' && isContentEditable) {
+          // Shift+Enter inserts a clean line break in rich editors (DraftJS/Quill/ProseMirror)
+          // without risking form submission or autocomplete commit.
+          await this.pressKey('Enter', 8, { holdMs: step.holdMs });
+        } else {
+          await this.pressKey(step.text, 0, { holdMs: step.holdMs });
+        }
+        await this._humanSleep(step.delayMs);
+      } else if (step.kind === 'ime') {
+        await this._humanSleep(step.preDelayMs);
+        await this.send('Input.insertText', { text: step.text });
+        await this._humanSleep(step.delayMs);
+      }
+    }
+  }
+
+  async fillText(selectors, text, { clear = true, timeoutMs = 15_000 } = {}) {
     await this.ensureInitialized();
     const list = normalizeSelectors(selectors);
     const content = String(text ?? '');
-    const clicked = await this.clickAny(list, { timeoutMs, humanJitter });
+    const clicked = await this.clickAny(list, { timeoutMs });
 
-    // Ensure DOM focus on the exact matched element.
-    await this.evaluate(
+    // Ensure DOM focus and detect target type (single-line <input> vs <textarea> vs contenteditable).
+    const targetInfo = await this.evaluate(
       `(() => {
         ${IN_PAGE_FINDER_SOURCE}
         const hit = __svFindElement(${JSON.stringify([clicked.selector])}, true);
-        if (hit && hit.el && typeof hit.el.focus === 'function') hit.el.focus();
+        if (!hit || !hit.el) return { tagName: '', isContentEditable: false };
+        if (document.activeElement !== hit.el && typeof hit.el.focus === 'function') {
+          hit.el.focus();
+        }
+        return {
+          tagName: (hit.el.tagName || '').toLowerCase(),
+          isContentEditable: Boolean(hit.el.isContentEditable),
+        };
       })()`,
-    );
+    ) || { tagName: '', isContentEditable: false };
 
     if (clear) {
-      // Select all via Cmd+A (macOS) or Ctrl+A (Linux/Win), then Backspace.
-      const selectAllMod = process.platform === 'darwin' ? 4 : 2; // Meta=4, Control=2
-      await this.pressKey('a', selectAllMod);
-      await sleep(40);
+      // Humanized Cmd/Ctrl+A -> 70–150ms -> Backspace (with macOS editing command `selectAll`).
+      const isDarwin = process.platform === 'darwin';
+      const selectAllMod = isDarwin ? 4 : 2; // Meta=4, Control=2
+      await this.pressKey('a', selectAllMod, isDarwin ? { commands: ['selectAll'] } : {});
+      await this._humanSleep(randInt(70, 150, this.rng));
       await this.pressKey('Backspace');
-      await sleep(40);
+      await this._humanSleep(randInt(60, 130, this.rng));
+    }
 
-      // Backup clear for controlled <input>/<textarea> if still populated.
+    await this._humanSleep(randInt(80, 180, this.rng));
+    if (content) {
+      await this._typeHumanText(content, targetInfo);
+    }
+    await this._humanSleep(randInt(100, 220, this.rng));
+
+    // Emergency diagnostic fallback ONLY if an <input>/<textarea> remained completely empty.
+    if (content) {
+      const expectedValue = targetInfo.tagName === 'input'
+        ? content.replace(/\r\n?|\n/g, ' ')
+        : content.replace(/\r\n?/g, '\n');
       await this.evaluate(
-        `(() => {
+        `((expected) => {
           ${IN_PAGE_FINDER_SOURCE}
           const hit = __svFindElement(${JSON.stringify([clicked.selector])}, true);
           if (!hit || !hit.el) return;
           const el = hit.el;
           const tag = (el.tagName || '').toLowerCase();
-          if ((tag === 'input' || tag === 'textarea') && el.value) {
+          if ((tag === 'input' || tag === 'textarea') && String(el.value || '').trim().length === 0) {
             const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
             const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-            if (setter) setter.call(el, '');
-            else el.value = '';
+            if (setter) setter.call(el, expected);
+            else el.value = expected;
             el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
           }
-        })()`,
+        })(${JSON.stringify(expectedValue)})`,
       );
     }
-
-    if (humanJitter) await sleep(randomInt(60, 150));
-    if (content) {
-      await this.send('Input.insertText', { text: content });
-    }
-    if (humanJitter) await sleep(randomInt(80, 180));
-
-    // Verify input/textarea accepted value; fallback to native setter + events if needed.
-    await this.evaluate(
-      `((expected) => {
-        ${IN_PAGE_FINDER_SOURCE}
-        const hit = __svFindElement(${JSON.stringify([clicked.selector])}, true);
-        if (!hit || !hit.el) return;
-        const el = hit.el;
-        const tag = (el.tagName || '').toLowerCase();
-        if ((tag === 'input' || tag === 'textarea') && expected && !String(el.value || '').includes(expected.slice(0, Math.min(12, expected.length)))) {
-          const proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-          if (setter) setter.call(el, expected);
-          else el.value = expected;
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      })(${JSON.stringify(content)})`,
-    );
 
     return { selector: clicked.selector };
   }
@@ -904,44 +1352,42 @@ export class CdpPage {
     const list = normalizeSelectors(selectors);
     let isContentEditable = false;
     if (list.length > 0) {
-      const clicked = await this.clickAny(list, { timeoutMs, humanJitter: true });
+      const clicked = await this.clickAny(list, { timeoutMs });
       isContentEditable = Boolean(await this.evaluate(
         `(() => {
           ${IN_PAGE_FINDER_SOURCE}
           const hit = __svFindElement(${JSON.stringify([clicked.selector])}, true);
-          if (!hit || !hit.el) return false;
-          const el = hit.el;
-          if (el.isContentEditable) {
-            el.focus();
-            const range = el.ownerDocument.createRange();
-            range.selectNodeContents(el);
-            range.collapse(false);
-            const sel = el.ownerDocument.defaultView.getSelection();
-            if (sel) {
-              sel.removeAllRanges();
-              sel.addRange(range);
-            }
-            return true;
-          }
-          return false;
+          return Boolean(hit && hit.el && hit.el.isContentEditable);
         })()`,
       ));
+
+      if (isContentEditable) {
+        // Move caret naturally to end of contenteditable:
+        // macOS Chrome requires Meta+ArrowDown + `commands: ['moveToEndOfDocument']`,
+        // while Windows/Linux use Ctrl+End.
+        if (process.platform === 'darwin') {
+          await this.pressKey('ArrowDown', 4, { commands: ['moveToEndOfDocument'] });
+        } else {
+          await this.pressKey('End', 2);
+        }
+        await this._humanSleep(randInt(45, 95, this.rng));
+      }
     }
 
     const textToInsert = isContentEditable
       ? (rawTag.startsWith('#') ? ` ${rawTag}` : ` #${rawTag}`)
       : rawTag;
 
-    await sleep(randomInt(80, 160));
-    await this.send('Input.insertText', { text: textToInsert });
-    await sleep(randomInt(500, 900));
+    await this._humanSleep(randInt(90, 180, this.rng));
+    await this._typeHumanText(textToInsert, { isContentEditable });
+    await this._humanSleep(randInt(600, 1300, this.rng));
 
     const suggestions = normalizeSelectors(suggestionSelectors);
     if (suggestions.length > 0) {
       try {
-        await this.waitForAny(suggestions, { timeoutMs: 2_500, visible: true, pollMs: 200 });
-        await this.clickAny(suggestions, { timeoutMs: 2_000, humanJitter: true });
-        await sleep(randomInt(200, 400));
+        await this.waitForAny(suggestions, { timeoutMs: 2_500, visible: true, pollMs: 220 });
+        await this.clickAny(suggestions, { timeoutMs: 2_000 });
+        await this._humanSleep(randInt(220, 440, this.rng));
         return;
       } catch {
         // Fallback to commitKey when autocomplete popup does not appear.
@@ -950,7 +1396,7 @@ export class CdpPage {
 
     if (commitKey) {
       await this.pressKey(commitKey);
-      await sleep(randomInt(200, 400));
+      await this._humanSleep(randInt(220, 440, this.rng));
     }
   }
 

@@ -1,17 +1,21 @@
 import {
+  buildGuardAbortResult,
   buildResult,
   captureScreenshot,
+  checkPageGuardState,
   clampText,
   clickWithTextFallback,
-  detectVerificationPrompt,
   formatScheduleLocal,
   humanDelay,
+  humanPause,
+  jitteredInterval,
   normalizeTags,
   readPageText,
   reportProgress,
   safeQueryAny,
   validateCommonMedia,
   validateScheduleWindow,
+  warmupUploadPage,
 } from './base.mjs';
 
 export const spec = Object.freeze({
@@ -45,6 +49,13 @@ const LOGIN_SELECTORS = [
   '.bili-mini-login-wrapper',
   'input[placeholder*="请输入账号"]',
   '.btn_primary.login-btn',
+];
+
+const UPLOAD_DROPZONE_SELECTORS = [
+  '.bcc-upload-wrapper',
+  '.upload-btn',
+  '[class*="upload-drag"]',
+  '[class*="upload-area"]',
 ];
 
 const VIDEO_INPUT_SELECTORS = [
@@ -201,6 +212,18 @@ function isBilibiliLoginUrl(url) {
   return typeof url === 'string' && (/passport\.bilibili\.com\/login/i.test(url) || /\/login(?:[/?#]|$)/i.test(url));
 }
 
+function checkBilibiliGuard(page, { stage = 'flow', inFlow = false } = {}) {
+  return checkPageGuardState(page, {
+    platformName: spec.name,
+    stage,
+    inFlow,
+    isLoginUrl: isBilibiliLoginUrl,
+    loginSelectors: LOGIN_SELECTORS,
+    verificationSelectors: VERIFICATION_MODAL_SELECTORS,
+    extraLoginTextRegex: /扫码登录|密码登录|短信登录/,
+  });
+}
+
 async function resolveUploadFrameUrl(page) {
   if (!page || typeof page.evaluate !== 'function') return null;
   try {
@@ -227,37 +250,21 @@ export async function checkAuth(page) {
   await page.navigate(spec.uploadUrl, { timeoutMs: 30_000 });
   await humanDelay(600, 1100, page);
 
-  const currentUrl = (await page.url()) || '';
-  const pageText = await readPageText(page);
-  const verify = detectVerificationPrompt(pageText);
-
-  if (verify.detected) {
+  const guard = await checkBilibiliGuard(page, { stage: 'check_auth', inFlow: false });
+  if (guard.blocked) {
     return {
       platform: spec.id,
       loggedIn: false,
-      status: 'needs_verification',
+      status: guard.status,
       handle: null,
       accountName: null,
-      url: currentUrl,
-      message: `B站创作中心触发安全验证（${verify.kind}），请先在浏览器完成验证`,
-      diagnostics: { verification: verify },
+      url: guard.url,
+      message: guard.message,
+      diagnostics: guard.diagnostics,
     };
   }
 
-  const loginDom = await safeQueryAny(page, LOGIN_SELECTORS);
-  if (isBilibiliLoginUrl(currentUrl) || (loginDom.found && loginDom.visible) || /扫码登录|密码登录|短信登录/.test(pageText)) {
-    return {
-      platform: spec.id,
-      loggedIn: false,
-      status: 'needs_login',
-      handle: null,
-      accountName: null,
-      url: currentUrl,
-      message: 'B站创作中心未登录，请先调用 open_login 扫码登录',
-      diagnostics: { loginSelector: loginDom.selector },
-    };
-  }
-
+  const currentUrl = guard.url || (await page.url()) || '';
   const uploadDom = await safeQueryAny(page, [...VIDEO_INPUT_SELECTORS, 'iframe[name="videoUpload"]', '.bcc-upload-wrapper']);
   const loggedIn = currentUrl.includes('member.bilibili.com') && uploadDom.found;
 
@@ -290,28 +297,20 @@ export async function openLogin(page) {
   };
 }
 
-async function detectBilibiliVerification(page) {
-  const pageText = await readPageText(page);
-  const textCheck = detectVerificationPrompt(pageText);
-  if (textCheck.detected) return textCheck;
-  const modal = await safeQueryAny(page, VERIFICATION_MODAL_SELECTORS);
-  if (modal.found && modal.visible) {
-    return { detected: true, kind: 'captcha', matched: modal.selector };
-  }
-  return { detected: false, kind: null, matched: null };
-}
-
 async function waitForBilibiliUploadComplete(page, ctx, diagnostics) {
   const timeoutMs = ctx.options?.uploadTimeoutMs ?? 180_000;
-  const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1500;
+  const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1800;
   const deadline = Date.now() + timeoutMs;
 
   let iteration = 0;
   while (iteration === 0 || Date.now() < deadline) {
     iteration += 1;
-    const verify = await detectBilibiliVerification(page);
-    if (verify.detected) {
-      return { state: 'needs_verification', verify };
+
+    // Run unified risk-control & forced-logout guard on EVERY poll iteration
+    const guard = await checkBilibiliGuard(page, { stage: 'transcode', inFlow: true });
+    if (guard.blocked) {
+      diagnostics.uploadIterations = iteration;
+      return { state: 'guard_blocked', guard };
     }
 
     const pageText = await readPageText(page);
@@ -329,7 +328,7 @@ async function waitForBilibiliUploadComplete(page, ctx, diagnostics) {
     }
 
     if (Date.now() >= deadline) break;
-    await page.sleep(pollIntervalMs);
+    await page.sleep(jitteredInterval(pollIntervalMs));
   }
 
   return { state: 'timeout', reason: '等待B站视频上传完成超时' };
@@ -357,33 +356,12 @@ export async function publishVideo(page, ctx) {
     await page.navigate(spec.uploadUrl, { timeoutMs: 30_000 });
     await humanDelay(600, 1200, page);
 
-    let currentUrl = (await page.url()) || '';
-    const initialVerify = await detectBilibiliVerification(page);
-    if (initialVerify.detected) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: currentUrl,
-        screenshotPath,
-        message: `B站触发安全验证（${initialVerify.kind}），请先在浏览器完成验证`,
-        diagnostics: { ...diagnostics, verification: initialVerify },
-      });
+    const postNavGuard = await checkBilibiliGuard(page, { stage: 'post_navigate', inFlow: false });
+    if (postNavGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, postNavGuard, diagnostics);
     }
 
-    const initialText = await readPageText(page);
-    const loginDom = await safeQueryAny(page, LOGIN_SELECTORS);
-    if (isBilibiliLoginUrl(currentUrl) || (loginDom.found && loginDom.visible) || /扫码登录|密码登录/.test(initialText)) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'needs_login', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_login',
-        url: currentUrl,
-        screenshotPath,
-        message: 'B站创作中心未登录，请先登录后重试',
-        diagnostics,
-      });
-    }
+    let currentUrl = postNavGuard.url || (await page.url()) || '';
 
     // Handle Bilibili's iframe-hosted upload shell if file input isn't on top document
     const directInput = await safeQueryAny(page, VIDEO_INPUT_SELECTORS);
@@ -393,27 +371,26 @@ export async function publishVideo(page, ctx) {
         diagnostics.steps.push({ step: 'enter_upload_frame', frameUrl });
         await page.navigate(frameUrl, { timeoutMs: 30_000 });
         await humanDelay(500, 1000, page);
-        currentUrl = (await page.url()) || frameUrl;
+        const frameGuard = await checkBilibiliGuard(page, { stage: 'post_navigate_frame', inFlow: false });
+        if (frameGuard.blocked) {
+          return buildGuardAbortResult(page, ctx, spec, frameGuard, diagnostics);
+        }
+        currentUrl = frameGuard.url || frameUrl;
       }
     }
+
+    // Natural page warmup (1.8–3.5s dwell + cursor drift + dropzone hover) before setFiles
+    await warmupUploadPage(page, UPLOAD_DROPZONE_SELECTORS);
 
     reportProgress(ctx, spec.id, 'upload', '正在上传视频到 B站');
     const fileRes = await page.setFiles(VIDEO_INPUT_SELECTORS, [ctx.videoPath]);
     diagnostics.steps.push({ step: 'upload_file', selector: fileRes?.selector || null });
-    await humanDelay(600, 1200, page);
+    await humanPause(page, 900, 1800);
 
     reportProgress(ctx, spec.id, 'transcode', '正在等待 B站 视频上传完成');
     const uploadState = await waitForBilibiliUploadComplete(page, ctx, diagnostics);
-    if (uploadState.state === 'needs_verification') {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: await page.url(),
-        screenshotPath,
-        message: 'B站在视频上传阶段弹出安全验证，请在浏览器中完成验证',
-        diagnostics: { ...diagnostics, verification: uploadState.verify },
-      });
+    if (uploadState.state === 'guard_blocked') {
+      return buildGuardAbortResult(page, ctx, spec, uploadState.guard, diagnostics);
     }
     if (uploadState.state !== 'ready') {
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'upload_failed', diagnostics);
@@ -427,56 +404,78 @@ export async function publishVideo(page, ctx) {
       });
     }
 
+    // Pre-fill guard check + natural pause
+    const preFillGuard = await checkBilibiliGuard(page, { stage: 'pre_fill', inFlow: true });
+    if (preFillGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, preFillGuard, diagnostics);
+    }
+    await humanPause(page, 900, 2000);
+
     // Fill title (<= 80 chars)
     if (adapted.title) {
       reportProgress(ctx, spec.id, 'fill_title', '正在填写 B站 稿件标题');
       await page.fillText(TITLE_SELECTORS, adapted.title, { clear: true, humanJitter: true });
       diagnostics.steps.push({ step: 'fill_title', length: Array.from(adapted.title).length });
-      await humanDelay(250, 550, page);
+      await humanPause(page, 900, 2000);
     }
 
     // Original vs Repost selection (自制 / 转载)
     if (adapted.options.original === false) {
       const repostClick = await clickWithTextFallback(page, [], ['转载'], { timeoutMs: 2500, exact: true });
       diagnostics.steps.push({ step: 'original_flag', original: false, applied: repostClick.clicked });
+      await humanPause(page, 500, 1000);
     } else if (adapted.options.original === true) {
       const origClick = await clickWithTextFallback(page, [], ['自制'], { timeoutMs: 2500, exact: true });
       diagnostics.steps.push({ step: 'original_flag', original: true, applied: origClick.clicked });
+      await humanPause(page, 500, 1000);
     }
 
     // Fill tags (<= 10)
     if (adapted.tags.length > 0) {
+      const preTagsGuard = await checkBilibiliGuard(page, { stage: 'pre_fill_tags', inFlow: true });
+      if (preTagsGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, preTagsGuard, diagnostics);
+      }
       reportProgress(ctx, spec.id, 'fill_tags', `正在添加 ${adapted.tags.length} 个 B站 标签`);
       for (const tag of adapted.tags) {
         await page.typeTag(TAG_INPUT_SELECTORS, tag, {
           suggestionSelectors: TAG_SUGGESTION_SELECTORS,
           commitKey: 'Enter',
         });
-        await humanDelay(200, 500, page);
+        await humanPause(page, 450, 950);
       }
       diagnostics.steps.push({ step: 'fill_tags', count: adapted.tags.length });
+      await humanPause(page, 900, 1800);
     }
 
     // Fill description (<= 2000 chars)
     if (adapted.description) {
+      const preDescGuard = await checkBilibiliGuard(page, { stage: 'pre_fill_description', inFlow: true });
+      if (preDescGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, preDescGuard, diagnostics);
+      }
       reportProgress(ctx, spec.id, 'fill_description', '正在填写 B站 视频简介');
       await page.fillText(DESC_SELECTORS, adapted.description, { clear: true, humanJitter: true });
       diagnostics.steps.push({ step: 'fill_description', length: Array.from(adapted.description).length });
-      await humanDelay(250, 550, page);
+      await humanPause(page, 1100, 2400);
     }
 
     // Optional cover upload
     if (adapted.coverPath) {
+      const preCoverGuard = await checkBilibiliGuard(page, { stage: 'pre_upload_cover', inFlow: true });
+      if (preCoverGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, preCoverGuard, diagnostics);
+      }
       reportProgress(ctx, spec.id, 'upload_cover', '正在上传 B站 稿件封面');
       const openCover = await clickWithTextFallback(page, COVER_TRIGGER_SELECTORS, ['更改封面', '上传封面', '封面设置'], {
         timeoutMs: 3000,
       });
       if (openCover.clicked) {
-        await humanDelay(400, 800, page);
+        await humanPause(page, 500, 1000);
         await page.setFiles(COVER_INPUT_SELECTORS, [adapted.coverPath]);
-        await humanDelay(800, 1400, page);
+        await humanPause(page, 1000, 1800);
         await clickWithTextFallback(page, COVER_CONFIRM_SELECTORS, ['完成', '确定'], { timeoutMs: 3000, exact: true });
-        await humanDelay(400, 800, page);
+        await humanPause(page, 900, 1800);
         diagnostics.steps.push({ step: 'upload_cover', applied: true });
       } else {
         diagnostics.steps.push({ step: 'upload_cover', applied: false, reason: 'cover_button_not_found' });
@@ -491,7 +490,7 @@ export async function publishVideo(page, ctx) {
         const schedToggle = await clickWithTextFallback(page, ['.timing-wrp .bcc-switch'], ['定时发布'], {
           timeoutMs: 3000,
         });
-        await humanDelay(300, 600, page);
+        await humanPause(page, 500, 1000);
         if (schedToggle.clicked) {
           const dateField = await safeQueryAny(page, SCHEDULE_DATE_SELECTORS);
           if (dateField.found) {
@@ -502,24 +501,18 @@ export async function publishVideo(page, ctx) {
             await page.fillText(SCHEDULE_TIME_SELECTORS, localSched.time, { clear: true, humanJitter: false });
           }
           diagnostics.steps.push({ step: 'schedule', dateTime: localSched.dateTime, applied: true });
-          await humanDelay(300, 600, page);
+          await humanPause(page, 600, 1200);
         } else {
           diagnostics.steps.push({ step: 'schedule', dateTime: localSched.dateTime, applied: false });
         }
       }
     }
 
-    const preVerify = await detectBilibiliVerification(page);
-    if (preVerify.detected) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: await page.url(),
-        screenshotPath,
-        message: `B站弹出安全验证（${preVerify.kind}），请在浏览器完成验证`,
-        diagnostics: { ...diagnostics, verification: preVerify },
-      });
+    // Natural pre-submit pause (1.5–3.0s) & unified guard check
+    await humanPause(page, 1500, 3000);
+    const preSubmitGuard = await checkBilibiliGuard(page, { stage: 'pre_submit', inFlow: true });
+    if (preSubmitGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, preSubmitGuard, diagnostics);
     }
 
     // Draft mode (存草稿)
@@ -529,11 +522,16 @@ export async function publishVideo(page, ctx) {
         timeoutMs: 3000,
       });
       if (draftClick.clicked) {
-        await humanDelay(800, 1400, page);
+        await humanPause(page, 900, 1600);
+        const postDraftGuard = await checkBilibiliGuard(page, { stage: 'post_draft', inFlow: true });
+        if (postDraftGuard.blocked) {
+          return buildGuardAbortResult(page, ctx, spec, postDraftGuard, diagnostics);
+        }
         diagnostics.draftMethod = 'button_click';
         diagnostics.draftSelector = draftClick.selector;
       } else {
         diagnostics.draftMethod = 'form_populated';
+        diagnostics.keepTabOpen = true;
       }
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'draft_saved', diagnostics);
       return buildResult({
@@ -543,7 +541,7 @@ export async function publishVideo(page, ctx) {
         screenshotPath,
         message: draftClick.clicked
           ? 'B站视频稿件已保存至草稿箱'
-          : 'B站投稿信息已填充完成（未找到存草稿按钮，页面保持待审核状态）',
+          : 'B站投稿信息已填充完成（未找到存草稿按钮，已保留当前标签页以防表单丢失）',
         diagnostics,
       });
     }
@@ -555,20 +553,21 @@ export async function publishVideo(page, ctx) {
       exact: true,
     });
     if (!publishClick.clicked) {
+      diagnostics.keepTabOpen = true;
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'publish_btn_missing', diagnostics);
       return buildResult({
         platform: spec.id,
         status: 'failed',
         url: await page.url(),
         screenshotPath,
-        message: '未找到 B站「立即投稿」按钮，已保留当前稿件内容',
+        message: '未找到 B站「立即投稿」按钮，已保留当前稿件内容与标签页',
         diagnostics,
       });
     }
     diagnostics.steps.push({ step: 'click_publish', selector: publishClick.selector });
 
     const publishTimeoutMs = ctx.options?.publishTimeoutMs ?? 20_000;
-    const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1000;
+    const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1200;
     const deadline = Date.now() + publishTimeoutMs;
     let publishedConfirmed = false;
     let finalUrl = (await page.url()) || '';
@@ -576,20 +575,12 @@ export async function publishVideo(page, ctx) {
     let iter = 0;
     while (iter === 0 || Date.now() < deadline) {
       iter += 1;
-      await page.sleep(pollIntervalMs);
+      await page.sleep(jitteredInterval(pollIntervalMs));
       finalUrl = (await page.url()) || '';
 
-      const postVerify = await detectBilibiliVerification(page);
-      if (postVerify.detected) {
-        const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-        return buildResult({
-          platform: spec.id,
-          status: 'needs_verification',
-          url: finalUrl,
-          screenshotPath,
-          message: `提交投稿后 B站 弹出安全验证（${postVerify.kind}），请在浏览器中完成验证`,
-          diagnostics: { ...diagnostics, verification: postVerify },
-        });
+      const postGuard = await checkBilibiliGuard(page, { stage: 'post_submit', inFlow: true });
+      if (postGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, postGuard, diagnostics);
       }
 
       const afterText = await readPageText(page);
@@ -613,6 +604,7 @@ export async function publishVideo(page, ctx) {
     );
 
     if (!publishedConfirmed) {
+      diagnostics.keepTabOpen = true;
       return buildResult({
         platform: spec.id,
         status: 'failed',

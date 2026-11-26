@@ -1,17 +1,21 @@
 import {
+  buildGuardAbortResult,
   buildResult,
   captureScreenshot,
+  checkPageGuardState,
   clampText,
   clickWithTextFallback,
-  detectVerificationPrompt,
   formatScheduleLocal,
   humanDelay,
+  humanPause,
+  jitteredInterval,
   normalizeTags,
   readPageText,
   reportProgress,
   safeQueryAny,
   validateCommonMedia,
   validateScheduleWindow,
+  warmupUploadPage,
 } from './base.mjs';
 
 export const spec = Object.freeze({
@@ -45,6 +49,14 @@ const LOGIN_SELECTORS = [
   '.login-container',
   '.login-box-container',
   '[class*="login-btn"]',
+];
+
+const UPLOAD_DROPZONE_SELECTORS = [
+  '.upload-wrapper',
+  '.drag-over',
+  '[class*="upload-area"]',
+  '[class*="upload-content"]',
+  '.upload-input',
 ];
 
 const VIDEO_INPUT_SELECTORS = [
@@ -107,6 +119,13 @@ const DRAFT_BUTTON_SELECTORS = [
   'button.draft-btn',
   'button[class*="draft"]',
   '.publish-page-publish-btn button.cancel',
+  '.publish-page-publish-btn button.d-button--default',
+  '.submit button.cancel',
+  '.submit button[class*="cancel"]',
+  '.publish-footer button[class*="draft"]',
+  '.publish-footer button.cancel',
+  '[class*="publish-btn"] button.cancel',
+  '[class*="footer"] button.cancel',
 ];
 
 const PUBLISH_BUTTON_SELECTORS = [
@@ -206,41 +225,37 @@ function isLoginUrl(url) {
   return typeof url === 'string' && (/\/login(?:[/?#]|$)/i.test(url) || url.includes('passport.xiaohongshu.com'));
 }
 
+function checkXhsGuard(page, { stage = 'flow', inFlow = false } = {}) {
+  return checkPageGuardState(page, {
+    platformName: spec.name,
+    stage,
+    inFlow,
+    isLoginUrl,
+    loginSelectors: LOGIN_SELECTORS,
+    verificationSelectors: VERIFICATION_MODAL_SELECTORS,
+    extraLoginTextRegex: /短信登录|扫码登录/,
+  });
+}
+
 export async function checkAuth(page) {
   await page.navigate(spec.uploadUrl, { timeoutMs: 30_000 });
   await humanDelay(600, 1100, page);
 
-  const currentUrl = (await page.url()) || '';
-  const pageText = await readPageText(page);
-
-  const verify = detectVerificationPrompt(pageText);
-  if (verify.detected) {
+  const guard = await checkXhsGuard(page, { stage: 'check_auth', inFlow: false });
+  if (guard.blocked) {
     return {
       platform: spec.id,
       loggedIn: false,
-      status: 'needs_verification',
+      status: guard.status,
       handle: null,
       accountName: null,
-      url: currentUrl,
-      message: `小红书创作者中心触发安全验证（${verify.kind}），请先在浏览器完成验证`,
-      diagnostics: { verification: verify },
+      url: guard.url,
+      message: guard.message,
+      diagnostics: guard.diagnostics,
     };
   }
 
-  const loginDom = await safeQueryAny(page, LOGIN_SELECTORS);
-  if (isLoginUrl(currentUrl) || (loginDom.found && loginDom.visible) || /短信登录|扫码登录/.test(pageText)) {
-    return {
-      platform: spec.id,
-      loggedIn: false,
-      status: 'needs_login',
-      handle: null,
-      accountName: null,
-      url: currentUrl,
-      message: '小红书创作者中心未登录，请先调用 open_login 扫码登录',
-      diagnostics: { loginSelector: loginDom.selector },
-    };
-  }
-
+  const currentUrl = guard.url || (await page.url()) || '';
   const uploadDom = await safeQueryAny(page, [...VIDEO_INPUT_SELECTORS, ...TITLE_SELECTORS]);
   const accountName = await extractAccountName(page);
   const loggedIn = currentUrl.includes('creator.xiaohongshu.com') && (uploadDom.found || Boolean(accountName));
@@ -303,19 +318,21 @@ async function extractAccountName(page) {
 
 async function waitForUploadComplete(page, ctx, diagnostics) {
   const timeoutMs = ctx.options?.uploadTimeoutMs ?? 180_000;
-  const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1500;
+  const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1800;
   const deadline = Date.now() + timeoutMs;
 
   let iteration = 0;
   while (iteration === 0 || Date.now() < deadline) {
     iteration += 1;
-    const pageText = await readPageText(page);
-    const verify = detectVerificationPrompt(pageText);
-    const verifyModal = await safeQueryAny(page, VERIFICATION_MODAL_SELECTORS);
-    if (verify.detected || (verifyModal.found && verifyModal.visible)) {
-      return { state: 'needs_verification', verify };
+
+    // Run unified risk-control & mid-flow logout guard on EVERY poll iteration
+    const guard = await checkXhsGuard(page, { stage: 'transcode', inFlow: true });
+    if (guard.blocked) {
+      diagnostics.uploadIterations = iteration;
+      return { state: 'guard_blocked', guard };
     }
 
+    const pageText = await readPageText(page);
     if (/上传失败|转码失败|格式不支持/.test(pageText)) {
       return { state: 'failed', reason: '小红书提示视频上传或转码失败' };
     }
@@ -331,7 +348,7 @@ async function waitForUploadComplete(page, ctx, diagnostics) {
     }
 
     if (Date.now() >= deadline) break;
-    await page.sleep(pollIntervalMs);
+    await page.sleep(jitteredInterval(pollIntervalMs));
   }
 
   return { state: 'timeout', reason: '等待小红书视频上传与转码完成超时' };
@@ -359,58 +376,30 @@ export async function publishVideo(page, ctx) {
     await page.navigate(spec.uploadUrl, { timeoutMs: 30_000 });
     await humanDelay(600, 1200, page);
 
-    const currentUrl = (await page.url()) || '';
-    const initialText = await readPageText(page);
-    const initialVerify = detectVerificationPrompt(initialText);
-    if (initialVerify.detected) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: currentUrl,
-        screenshotPath,
-        message: `小红书触发安全验证（${initialVerify.kind}），请手动完成后重试`,
-        diagnostics: { ...diagnostics, verification: initialVerify },
-      });
-    }
-
-    const loginDom = await safeQueryAny(page, LOGIN_SELECTORS);
-    if (isLoginUrl(currentUrl) || (loginDom.found && loginDom.visible) || /短信登录|扫码登录/.test(initialText)) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'needs_login', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_login',
-        url: currentUrl,
-        screenshotPath,
-        message: '小红书创作者中心未登录，请先登录后重试',
-        diagnostics,
-      });
+    const postNavGuard = await checkXhsGuard(page, { stage: 'post_navigate', inFlow: false });
+    if (postNavGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, postNavGuard, diagnostics);
     }
 
     // Ensure "上传视频" tab is active if file input is not immediately present
     const initialInput = await safeQueryAny(page, VIDEO_INPUT_SELECTORS);
     if (!initialInput.found) {
       await clickWithTextFallback(page, [], ['上传视频'], { timeoutMs: 3000, exact: true });
-      await humanDelay(300, 700, page);
+      await humanPause(page, 500, 1000);
     }
+
+    // Natural page warmup (1.8–3.5s dwell + cursor drift + dropzone hover) before setFiles
+    await warmupUploadPage(page, UPLOAD_DROPZONE_SELECTORS);
 
     reportProgress(ctx, spec.id, 'upload', '正在上传视频到小红书');
     const fileRes = await page.setFiles(VIDEO_INPUT_SELECTORS, [ctx.videoPath]);
     diagnostics.steps.push({ step: 'upload_file', selector: fileRes?.selector || null });
-    await humanDelay(500, 1000, page);
+    await humanPause(page, 900, 1800);
 
     reportProgress(ctx, spec.id, 'transcode', '正在等待小红书视频上传与转码完成');
     const uploadState = await waitForUploadComplete(page, ctx, diagnostics);
-    if (uploadState.state === 'needs_verification') {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: await page.url(),
-        screenshotPath,
-        message: '小红书在上传阶段弹出安全验证，请在浏览器完成验证',
-        diagnostics: { ...diagnostics, verification: uploadState.verify },
-      });
+    if (uploadState.state === 'guard_blocked') {
+      return buildGuardAbortResult(page, ctx, spec, uploadState.guard, diagnostics);
     }
     if (uploadState.state !== 'ready') {
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'upload_failed', diagnostics);
@@ -424,49 +413,69 @@ export async function publishVideo(page, ctx) {
       });
     }
 
+    // Pre-fill guard check + natural pause
+    const preFillGuard = await checkXhsGuard(page, { stage: 'pre_fill', inFlow: true });
+    if (preFillGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, preFillGuard, diagnostics);
+    }
+    await humanPause(page, 900, 2000);
+
     // Fill title
     if (adapted.title) {
       reportProgress(ctx, spec.id, 'fill_title', '正在填写小红书标题');
       await page.fillText(TITLE_SELECTORS, adapted.title, { clear: true, humanJitter: true });
       diagnostics.steps.push({ step: 'fill_title', length: Array.from(adapted.title).length });
-      await humanDelay(250, 600, page);
+      await humanPause(page, 900, 2000);
     }
 
     // Fill description
     if (adapted.description) {
+      const preDescGuard = await checkXhsGuard(page, { stage: 'pre_fill_description', inFlow: true });
+      if (preDescGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, preDescGuard, diagnostics);
+      }
       reportProgress(ctx, spec.id, 'fill_description', '正在填写小红书正文');
       await page.fillText(DESC_SELECTORS, adapted.description, { clear: true, humanJitter: true });
       diagnostics.steps.push({ step: 'fill_description', length: Array.from(adapted.description).length });
-      await humanDelay(250, 600, page);
+      await humanPause(page, 1100, 2400);
     }
 
     // Add #tags via topic selection
     if (adapted.tags.length > 0) {
+      const preTagsGuard = await checkXhsGuard(page, { stage: 'pre_fill_tags', inFlow: true });
+      if (preTagsGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, preTagsGuard, diagnostics);
+      }
       reportProgress(ctx, spec.id, 'fill_tags', `正在添加 ${adapted.tags.length} 个小红书话题标签`);
       for (const tag of adapted.tags) {
         await page.typeTag(DESC_SELECTORS, tag, {
           suggestionSelectors: TAG_SUGGESTION_SELECTORS,
           commitKey: 'Enter',
         });
-        await humanDelay(250, 550, page);
+        await humanPause(page, 450, 950);
       }
       diagnostics.steps.push({ step: 'fill_tags', count: adapted.tags.length });
+      await humanPause(page, 900, 1800);
     }
 
     // Optional cover upload
     if (adapted.coverPath) {
+      const preCoverGuard = await checkXhsGuard(page, { stage: 'pre_upload_cover', inFlow: true });
+      if (preCoverGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, preCoverGuard, diagnostics);
+      }
       reportProgress(ctx, spec.id, 'upload_cover', '正在设置小红书视频封面');
       const coverTrigger = await clickWithTextFallback(page, COVER_TRIGGER_SELECTORS, ['修改封面', '设置封面', '更换封面'], {
         timeoutMs: 3000,
       });
       if (coverTrigger.clicked) {
-        await humanDelay(300, 600, page);
+        await humanPause(page, 500, 1000);
         await clickWithTextFallback(page, [], ['上传封面', '本地上传'], { timeoutMs: 2500 });
-        await humanDelay(200, 450, page);
+        await humanPause(page, 400, 800);
         await page.setFiles(COVER_INPUT_SELECTORS, [adapted.coverPath]);
-        await humanDelay(800, 1400, page);
+        await humanPause(page, 1000, 1800);
         await clickWithTextFallback(page, COVER_CONFIRM_SELECTORS, ['确定', '完成'], { timeoutMs: 3000, exact: true });
-        await humanDelay(400, 800, page);
+        await humanPause(page, 900, 1800);
         diagnostics.steps.push({ step: 'upload_cover', applied: true });
       } else {
         diagnostics.steps.push({ step: 'upload_cover', applied: false, reason: 'cover_button_not_found' });
@@ -479,7 +488,7 @@ export async function publishVideo(page, ctx) {
         timeoutMs: 2500,
       });
       diagnostics.steps.push({ step: 'original_flag', applied: origRes.clicked });
-      await humanDelay(200, 450, page);
+      await humanPause(page, 500, 1000);
     }
 
     // Optional AI-generated disclosure
@@ -488,7 +497,7 @@ export async function publishVideo(page, ctx) {
         timeoutMs: 2500,
       });
       diagnostics.steps.push({ step: 'ai_generated_flag', applied: aiRes.clicked });
-      await humanDelay(200, 450, page);
+      await humanPause(page, 500, 1000);
     }
 
     // Optional visibility
@@ -497,7 +506,7 @@ export async function publishVideo(page, ctx) {
         timeoutMs: 2500,
       });
       diagnostics.steps.push({ step: 'visibility', target: adapted.options.visibility, applied: visRes.clicked });
-      await humanDelay(200, 450, page);
+      await humanPause(page, 500, 1000);
     }
 
     // Optional schedule
@@ -508,32 +517,23 @@ export async function publishVideo(page, ctx) {
         const schedToggle = await clickWithTextFallback(page, ['.schedule-switch', '[class*="post-time"]'], ['定时发布'], {
           timeoutMs: 3000,
         });
-        await humanDelay(300, 600, page);
+        await humanPause(page, 500, 1000);
         if (schedToggle.clicked) {
           await page.fillText(SCHEDULE_INPUT_SELECTORS, localSched.dateTime, { clear: true, humanJitter: false });
           await page.pressKey('Enter');
           diagnostics.steps.push({ step: 'schedule', dateTime: localSched.dateTime, applied: true });
-          await humanDelay(300, 600, page);
+          await humanPause(page, 600, 1200);
         } else {
           diagnostics.steps.push({ step: 'schedule', dateTime: localSched.dateTime, applied: false });
         }
       }
     }
 
-    // Pre-submit verification check
-    const preSubmitText = await readPageText(page);
-    const preSubmitVerify = detectVerificationPrompt(preSubmitText);
-    const preSubmitModal = await safeQueryAny(page, VERIFICATION_MODAL_SELECTORS);
-    if (preSubmitVerify.detected || (preSubmitModal.found && preSubmitModal.visible)) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: await page.url(),
-        screenshotPath,
-        message: '小红书弹出安全验证弹窗，请在浏览器完成验证后继续',
-        diagnostics: { ...diagnostics, verification: preSubmitVerify },
-      });
+    // Natural pre-submit pause (1.5–3.0s) & unified guard check
+    await humanPause(page, 1500, 3000);
+    const preSubmitGuard = await checkXhsGuard(page, { stage: 'pre_submit', inFlow: true });
+    if (preSubmitGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, preSubmitGuard, diagnostics);
     }
 
     // Draft vs Publish
@@ -543,11 +543,16 @@ export async function publishVideo(page, ctx) {
         timeoutMs: 3000,
       });
       if (draftClick.clicked) {
-        await humanDelay(800, 1400, page);
+        await humanPause(page, 900, 1600);
+        const postDraftGuard = await checkXhsGuard(page, { stage: 'post_draft', inFlow: true });
+        if (postDraftGuard.blocked) {
+          return buildGuardAbortResult(page, ctx, spec, postDraftGuard, diagnostics);
+        }
         diagnostics.draftMethod = 'button_click';
         diagnostics.draftSelector = draftClick.selector;
       } else {
         diagnostics.draftMethod = 'form_populated';
+        diagnostics.keepTabOpen = true;
       }
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'draft_saved', diagnostics);
       return buildResult({
@@ -557,7 +562,7 @@ export async function publishVideo(page, ctx) {
         screenshotPath,
         message: draftClick.clicked
           ? '小红书视频已保存至草稿箱'
-          : '小红书视频与文案已填充完成（未找到暂存按钮，页面保持待审核发布状态）',
+          : '小红书视频与文案已填充完成（未找到暂存按钮，已保留当前标签页以防表单丢失）',
         diagnostics,
       });
     }
@@ -571,13 +576,14 @@ export async function publishVideo(page, ctx) {
       { timeoutMs: 5000, exact: true }
     );
     if (!publishClick.clicked) {
+      diagnostics.keepTabOpen = true;
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'publish_btn_missing', diagnostics);
       return buildResult({
         platform: spec.id,
         status: 'failed',
         url: await page.url(),
         screenshotPath,
-        message: '未找到小红书发布按钮，已保留当前页面内容',
+        message: '未找到小红书发布按钮，已保留当前页面内容与标签页',
         diagnostics,
       });
     }
@@ -585,7 +591,7 @@ export async function publishVideo(page, ctx) {
     diagnostics.steps.push({ step: 'click_publish', selector: publishClick.selector });
 
     const publishTimeoutMs = ctx.options?.publishTimeoutMs ?? 20_000;
-    const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1000;
+    const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1200;
     const deadline = Date.now() + publishTimeoutMs;
     let publishedConfirmed = false;
     let finalUrl = (await page.url()) || '';
@@ -593,24 +599,15 @@ export async function publishVideo(page, ctx) {
     let iter = 0;
     while (iter === 0 || Date.now() < deadline) {
       iter += 1;
-      await page.sleep(pollIntervalMs);
+      await page.sleep(jitteredInterval(pollIntervalMs));
       finalUrl = (await page.url()) || '';
-      const afterText = await readPageText(page);
-      const afterVerify = detectVerificationPrompt(afterText);
-      const afterModal = await safeQueryAny(page, VERIFICATION_MODAL_SELECTORS);
 
-      if (afterVerify.detected || (afterModal.found && afterModal.visible)) {
-        const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-        return buildResult({
-          platform: spec.id,
-          status: 'needs_verification',
-          url: finalUrl,
-          screenshotPath,
-          message: `点击发布后小红书要求安全验证（${afterVerify.kind || 'modal'}），请在浏览器中完成验证`,
-          diagnostics: { ...diagnostics, verification: afterVerify },
-        });
+      const postGuard = await checkXhsGuard(page, { stage: 'post_submit', inFlow: true });
+      if (postGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, postGuard, diagnostics);
       }
 
+      const afterText = await readPageText(page);
       if (
         /\/publish\/success|\/new\/note-manager|\/creator\/post/i.test(finalUrl) ||
         /发布成功|定时发布成功|笔记已发布|已进入审核/.test(afterText)
@@ -631,6 +628,7 @@ export async function publishVideo(page, ctx) {
     );
 
     if (!publishedConfirmed) {
+      diagnostics.keepTabOpen = true;
       return buildResult({
         platform: spec.id,
         status: 'failed',

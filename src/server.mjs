@@ -5,6 +5,7 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import {
   DEFAULT_WAIT_SECONDS,
+  DEVICE_BOUND_COOKIE_PLATFORMS,
   MCP_PROTOCOL_VERSION,
   PLUGIN_NAME,
   PLUGIN_VERSION,
@@ -46,7 +47,11 @@ export const TOOLS = [
         cookieFiles: {
           type: 'object',
           additionalProperties: { type: 'string' },
-          description: '可选：按平台提供的 0600 Cookie 文件路径映射（如 {"xiaohongshu": "/path/to/xhs.cookie"}）。',
+          description: '可选：按平台提供的 0600 Cookie 文件路径映射。注意：抖音、小红书、X 存在设备/密钥绑定（bd_ticket_guard / cf_clearance），默认会拒绝跨配置注入以防风控踢出，推荐直接用 open_login 在持久化 Chrome 内原生登录一次。',
+        },
+        allowUnsafeCookieInjection: {
+          type: 'boolean',
+          description: '可选（默认 false，不建议开启）：仅在明确知晓跨配置 Cookie 移植可能触发抖音/小红书/X 风控下线时显式传 true 才允许注入；即便开启，若持久化 Chrome 已登录也绝不重复覆盖。',
         },
         cdpUrl: {
           type: 'string',
@@ -186,7 +191,11 @@ export const TOOLS = [
         cookieFiles: {
           type: 'object',
           additionalProperties: { type: 'string' },
-          description: '可选：按平台提供的 0600 Cookie 文件路径映射。',
+          description: '可选：按平台提供的 0600 Cookie 文件路径映射（设备绑定平台 douyin/xiaohongshu/x 默认拒绝跨配置注入，推荐使用 open_login 原生登录）。',
+        },
+        allowUnsafeCookieInjection: {
+          type: 'boolean',
+          description: '可选（默认 false，不建议开启）：仅在明确知晓风险时传 true 才允许对 douyin/xiaohongshu/x 注入 cookieFiles；若持久化 Chrome 已登录仍会跳过覆盖。',
         },
         cdpUrl: {
           type: 'string',
@@ -344,6 +353,7 @@ export function createPublisherService(deps = {}) {
     }
 
     const cookieFiles = args.cookieFiles && typeof args.cookieFiles === 'object' ? args.cookieFiles : {};
+    const allowUnsafeCookieInjection = args.allowUnsafeCookieInjection === true;
     let session = null;
     try {
       session = await sessionFactory({ cdpUrl: args.cdpUrl || '' });
@@ -355,22 +365,54 @@ export function createPublisherService(deps = {}) {
           page = await session.newPage();
           const cookiePath = cookieFiles[platformId]
             || Object.entries(cookieFiles).find(([k]) => resolveId(k) === platformId)?.[1];
-          if (cookiePath) {
-            const cookies = parseCookieFile(cookiePath, platformId);
-            if (cookies.length > 0) await page.setCookies(cookies);
+
+          let cookieInjectionBlocked = false;
+          let cookieInjectionSkipped = null;
+          let result = null;
+
+          if (cookiePath && DEVICE_BOUND_COOKIE_PLATFORMS.has(platformId) && !allowUnsafeCookieInjection) {
+            // Refuse cross-profile cookie transplant for device-bound platforms; inspect persistent profile natively.
+            cookieInjectionBlocked = true;
+            result = await adapter.checkAuth(page);
+          } else if (cookiePath) {
+            // Never overwrite an already logged-in persistent Chrome profile!
+            const nativeResult = await adapter.checkAuth(page);
+            const nativeLoggedIn = Boolean(nativeResult?.loggedIn ?? nativeResult?.status === 'logged_in');
+            if (nativeLoggedIn) {
+              cookieInjectionSkipped = 'already_logged_in';
+              result = nativeResult;
+            } else {
+              const cookies = parseCookieFile(cookiePath, platformId);
+              if (cookies.length > 0) await page.setCookies(cookies);
+              result = await adapter.checkAuth(page);
+            }
+          } else {
+            result = await adapter.checkAuth(page);
           }
-          const result = await adapter.checkAuth(page);
+
           const loggedIn = Boolean(result?.loggedIn ?? result?.status === 'logged_in');
           const accountName = result?.accountName || result?.handle || null;
+          const status = result?.status || (loggedIn ? 'logged_in' : 'needs_login');
+          let message = redactSensitiveText(result?.message || '');
+          if (cookieInjectionBlocked && !loggedIn) {
+            const guardMsg = `已阻止向 ${platformId} 注入跨配置 cookieFiles（该平台存在设备/密钥绑定如 bd_ticket_guard / cf_clearance，移植 Cookie 会触发风控强制下线）。请调用 open_login({ platform: "${platformId}" }) 在持久化 Chrome 配置目录中原生登录一次。`;
+            message = message ? `${guardMsg} ${message}` : guardMsg;
+          } else if (cookieInjectionBlocked && loggedIn) {
+            const note = `持久化 Chrome 配置目录已原生登录，已自动忽略跨配置 cookieFiles 注入。`;
+            message = message ? `${note} ${message}` : note;
+          }
+
           accounts.push({
             platform: platformId,
             name: adapter.spec.name,
-            status: result?.status || (loggedIn ? 'logged_in' : 'needs_login'),
+            status,
             loggedIn,
             accountName,
             handle: accountName,
             loginUrl: adapter.spec.loginUrl,
-            message: redactSensitiveText(result?.message || ''),
+            ...(cookieInjectionBlocked ? { cookieInjectionBlocked: true } : {}),
+            ...(cookieInjectionSkipped ? { cookieInjectionSkipped } : {}),
+            message,
           });
         } catch (error) {
           accounts.push({
@@ -637,6 +679,7 @@ export function createPublisherService(deps = {}) {
       mode: effectiveMode,
       confirmed: args.confirmed === true,
       cookieFiles: args.cookieFiles,
+      allowUnsafeCookieInjection: args.allowUnsafeCookieInjection === true,
       cdpUrl: args.cdpUrl,
       waitSeconds: clampWaitSeconds(args.waitSeconds, DEFAULT_WAIT_SECONDS),
     });

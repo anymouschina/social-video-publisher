@@ -2,9 +2,19 @@ import os from 'node:os';
 import path from 'node:path';
 
 export const PLUGIN_NAME = 'social-video-publisher';
-export const PLUGIN_VERSION = '0.1.0';
+export const PLUGIN_VERSION = '0.2.0';
 export const MCP_SERVER_NAME = 'social_pub';
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
+
+/**
+ * Platforms whose session cookies are cryptographically or device-bound
+ * (e.g., Douyin `bd_ticket_guard` WebCrypto IndexedDB keys & DBSC,
+ * Xiaohongshu device tokens, X `cf_clearance`). Transplanting raw cookies
+ * from another browser profile poisons the session and triggers forced logout
+ * or captcha challenges, so cross-profile `cookieFiles` injection is blocked
+ * by default unless `allowUnsafeCookieInjection: true` is explicitly passed.
+ */
+export const DEVICE_BOUND_COOKIE_PLATFORMS = Object.freeze(new Set(['douyin', 'xiaohongshu', 'x']));
 
 export const DEFAULT_WAIT_SECONDS = 25;
 export const MIN_WAIT_SECONDS = 0;
@@ -54,10 +64,16 @@ const SENSITIVE_COOKIE_NAMES = [
   'sessionid',
   'sessionid_ss',
   'sid_tt',
+  'd_ticket',
+  'x_tt_token',
+  'bd_ticket_guard_client_data',
+  '_bd_ticket_crypt_cookie',
+  'UIFID',
   'passport_csrf_token',
   'auth_token',
   'ct0',
   'twid',
+  'cf_clearance',
   'SESSDATA',
   'bili_jct',
   'DedeUserID',

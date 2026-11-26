@@ -1,14 +1,18 @@
 import {
+  buildGuardAbortResult,
   buildResult,
   captureScreenshot,
-  detectVerificationPrompt,
+  checkPageGuardState,
   humanDelay,
+  humanPause,
+  jitteredInterval,
   normalizeTags,
   readPageText,
   reportProgress,
   safeQueryAny,
   validateCommonMedia,
   validateScheduleWindow,
+  warmupUploadPage,
 } from './base.mjs';
 
 export const spec = Object.freeze({
@@ -45,6 +49,13 @@ const LOGIN_SELECTORS = [
   'a[href="/i/flow/login"]',
 ];
 
+const UPLOAD_DROPZONE_SELECTORS = [
+  '[data-testid="toolBar"]',
+  '[data-testid="tweetTextarea_0"]',
+  'button[aria-label*="Media"]',
+  'button[aria-label*="媒体"]',
+];
+
 const VIDEO_INPUT_SELECTORS = [
   'input[data-testid="fileInput"]',
   'input[type="file"][accept*="video"]',
@@ -74,6 +85,13 @@ const AUTH_INDICATOR_SELECTORS = [
   'input[data-testid="fileInput"]',
   '[data-testid="SideNav_AccountSwitcher_Button"]',
   '[data-testid="SideNav_NewTweet_Button"]',
+];
+
+const VERIFICATION_MODAL_SELECTORS = [
+  'iframe[src*="arkose"]',
+  'iframe[src*="captcha"]',
+  'iframe[src*="challenge"]',
+  '[data-testid="ocfEnterTextTextInput"]',
 ];
 
 const X_URL_WEIGHT = 23;
@@ -269,41 +287,37 @@ function isXChallengeUrl(url) {
   return typeof url === 'string' && /\/account\/access|\/i\/flow\/consent|arkose/i.test(url);
 }
 
+function checkXGuard(page, { stage = 'flow', inFlow = false } = {}) {
+  return checkPageGuardState(page, {
+    platformName: spec.name,
+    stage,
+    inFlow,
+    isLoginUrl: isXLoginUrl,
+    isChallengeUrl: isXChallengeUrl,
+    loginSelectors: LOGIN_SELECTORS,
+    verificationSelectors: VERIFICATION_MODAL_SELECTORS,
+  });
+}
+
 export async function checkAuth(page) {
   await page.navigate(spec.uploadUrl, { timeoutMs: 30_000 });
   await humanDelay(600, 1100, page);
 
-  const currentUrl = (await page.url()) || '';
-  const pageText = await readPageText(page);
-  const verify = detectVerificationPrompt(pageText);
-
-  if (isXChallengeUrl(currentUrl) || verify.detected) {
+  const guard = await checkXGuard(page, { stage: 'check_auth', inFlow: false });
+  if (guard.blocked) {
     return {
       platform: spec.id,
       loggedIn: false,
-      status: 'needs_verification',
+      status: guard.status,
       handle: null,
       accountName: null,
-      url: currentUrl,
-      message: `X (Twitter) 触发账号安全验证（${verify.kind || 'challenge'}），请先在浏览器完成验证`,
-      diagnostics: { verification: verify },
+      url: guard.url,
+      message: guard.message,
+      diagnostics: guard.diagnostics,
     };
   }
 
-  const loginDom = await safeQueryAny(page, LOGIN_SELECTORS);
-  if (isXLoginUrl(currentUrl) || (loginDom.found && loginDom.visible)) {
-    return {
-      platform: spec.id,
-      loggedIn: false,
-      status: 'needs_login',
-      handle: null,
-      accountName: null,
-      url: currentUrl,
-      message: 'X (Twitter) 未登录，请先调用 open_login 登录账号',
-      diagnostics: { loginSelector: loginDom.selector },
-    };
-  }
-
+  const currentUrl = guard.url || (await page.url()) || '';
   const authDom = await safeQueryAny(page, AUTH_INDICATOR_SELECTORS);
   const accountName = await extractAccountHandle(page);
   const loggedIn = authDom.found || Boolean(accountName);
@@ -363,19 +377,21 @@ async function extractAccountHandle(page) {
 
 async function waitForMediaAttachmentReady(page, ctx, diagnostics) {
   const timeoutMs = ctx.options?.uploadTimeoutMs ?? 120_000;
-  const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1500;
+  const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1800;
   const deadline = Date.now() + timeoutMs;
 
   let iteration = 0;
   while (iteration === 0 || Date.now() < deadline) {
     iteration += 1;
-    const currentUrl = (await page.url()) || '';
-    const pageText = await readPageText(page);
-    const verify = detectVerificationPrompt(pageText);
-    if (isXChallengeUrl(currentUrl) || verify.detected) {
-      return { state: 'needs_verification', verify };
+
+    // Run unified risk-control & forced-logout guard on EVERY poll tick
+    const guard = await checkXGuard(page, { stage: 'transcode', inFlow: true });
+    if (guard.blocked) {
+      diagnostics.uploadIterations = iteration;
+      return { state: 'guard_blocked', guard };
     }
 
+    const pageText = await readPageText(page);
     if (/media file could not be processed|video is too long|file type is not supported|failed to upload|无法处理媒体/i.test(pageText)) {
       return { state: 'failed', reason: 'X 提示视频文件无法处理或超出格式/时长限制' };
     }
@@ -393,7 +409,7 @@ async function waitForMediaAttachmentReady(page, ctx, diagnostics) {
     }
 
     if (Date.now() >= deadline) break;
-    await page.sleep(pollIntervalMs);
+    await page.sleep(jitteredInterval(pollIntervalMs));
   }
 
   return { state: 'timeout', reason: '等待 X 视频附件上传与处理完成超时' };
@@ -401,20 +417,24 @@ async function waitForMediaAttachmentReady(page, ctx, diagnostics) {
 
 async function waitForPostButtonEnabled(page, ctx) {
   const timeoutMs = ctx.options?.enableButtonTimeoutMs ?? 30_000;
-  const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1000;
+  const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1200;
   const deadline = Date.now() + timeoutMs;
 
   let iteration = 0;
   while (iteration === 0 || Date.now() < deadline) {
     iteration += 1;
+    const guard = await checkXGuard(page, { stage: 'wait_post_button', inFlow: true });
+    if (guard.blocked) {
+      return { ready: false, selector: null, guard };
+    }
     const btn = await safeQueryAny(page, POST_BUTTON_SELECTORS);
     if (btn.found && !btn.disabled) {
-      return { ready: true, selector: btn.selector };
+      return { ready: true, selector: btn.selector, guard: null };
     }
     if (Date.now() >= deadline) break;
-    await page.sleep(pollIntervalMs);
+    await page.sleep(jitteredInterval(pollIntervalMs));
   }
-  return { ready: false, selector: null };
+  return { ready: false, selector: null, guard: null };
 }
 
 async function extractPublishedStatusUrl(page) {
@@ -461,52 +481,24 @@ export async function publishVideo(page, ctx) {
     await page.navigate(spec.uploadUrl, { timeoutMs: 30_000 });
     await humanDelay(600, 1200, page);
 
-    const currentUrl = (await page.url()) || '';
-    const initialText = await readPageText(page);
-    const initialVerify = detectVerificationPrompt(initialText);
-    if (isXChallengeUrl(currentUrl) || initialVerify.detected) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: currentUrl,
-        screenshotPath,
-        message: `X (Twitter) 触发安全验证（${initialVerify.kind || 'challenge'}），请先在浏览器完成验证`,
-        diagnostics: { ...diagnostics, verification: initialVerify },
-      });
+    const postNavGuard = await checkXGuard(page, { stage: 'post_navigate', inFlow: false });
+    if (postNavGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, postNavGuard, diagnostics);
     }
 
-    const loginDom = await safeQueryAny(page, LOGIN_SELECTORS);
-    if (isXLoginUrl(currentUrl) || (loginDom.found && loginDom.visible)) {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'needs_login', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_login',
-        url: currentUrl,
-        screenshotPath,
-        message: 'X (Twitter) 未登录，请先登录后重试',
-        diagnostics,
-      });
-    }
+    // Natural page warmup (1.8–3.5s dwell + cursor drift + hover) BEFORE attaching video
+    await warmupUploadPage(page, UPLOAD_DROPZONE_SELECTORS);
 
     // CRITICAL X QUIRK: Upload video FIRST before typing text so X doesn't clear composer text on media attach.
     reportProgress(ctx, spec.id, 'upload', '正在先上传视频附件到 X（避免文案被覆盖）');
     const fileRes = await page.setFiles(VIDEO_INPUT_SELECTORS, [ctx.videoPath]);
     diagnostics.steps.push({ step: 'upload_video_first', selector: fileRes?.selector || null });
-    await humanDelay(500, 1000, page);
+    await humanPause(page, 900, 1800);
 
     reportProgress(ctx, spec.id, 'transcode', '正在等待 X 视频附件处理完成');
     const attachState = await waitForMediaAttachmentReady(page, ctx, diagnostics);
-    if (attachState.state === 'needs_verification') {
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-      return buildResult({
-        platform: spec.id,
-        status: 'needs_verification',
-        url: await page.url(),
-        screenshotPath,
-        message: 'X (Twitter) 在上传视频时要求安全验证，请在浏览器完成验证',
-        diagnostics: { ...diagnostics, verification: attachState.verify },
-      });
+    if (attachState.state === 'guard_blocked') {
+      return buildGuardAbortResult(page, ctx, spec, attachState.guard, diagnostics);
     }
     if (attachState.state !== 'ready') {
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'upload_failed', diagnostics);
@@ -520,6 +512,13 @@ export async function publishVideo(page, ctx) {
       });
     }
 
+    // Pre-fill guard check + natural pause before typing tweet text
+    const preFillGuard = await checkXGuard(page, { stage: 'pre_fill', inFlow: true });
+    if (preFillGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, preFillGuard, diagnostics);
+    }
+    await humanPause(page, 900, 2200);
+
     // THEN fill tweet text into [data-testid="tweetTextarea_0"]
     if (adapted.tweetText) {
       reportProgress(ctx, spec.id, 'fill_text', '正在填入推文文案与标签');
@@ -529,28 +528,39 @@ export async function publishVideo(page, ctx) {
         selector: fillRes?.selector || null,
         weightedLength: adapted.weightedLength,
       });
-      await humanDelay(300, 700, page);
+      await humanPause(page, 900, 2000);
+    }
+
+    // Pre-submit guard check
+    const preSubmitGuard = await checkXGuard(page, { stage: 'pre_submit', inFlow: true });
+    if (preSubmitGuard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, preSubmitGuard, diagnostics);
     }
 
     // Draft mode: keep composer populated without clicking Post
     if (mode === 'draft') {
       reportProgress(ctx, spec.id, 'save_draft', '已填充 X 发布器（草稿预览态，不点击发布）');
-      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'draft_saved', diagnostics);
       diagnostics.draftMethod = 'composer_populated';
+      diagnostics.keepTabOpen = true;
+      const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'draft_saved', diagnostics);
       return buildResult({
         platform: spec.id,
         status: 'draft_saved',
         url: await page.url(),
         screenshotPath,
-        message: '视频与推文文案已填入 X 发布器（草稿预览状态，未点击 Post）',
+        message: '视频与推文文案已填入 X 发布器（草稿预览状态，未点击 Post，已保留当前标签页）',
         diagnostics,
       });
     }
 
-    // Publish mode: wait until Post button is enabled, click, and verify confirmation / status URL
+    // Publish mode: wait until Post button is enabled, pause naturally, click, and verify confirmation / status URL
     reportProgress(ctx, spec.id, 'wait_post_button', '正在等待 X 发布按钮就绪');
     const postBtn = await waitForPostButtonEnabled(page, ctx);
+    if (postBtn.guard && postBtn.guard.blocked) {
+      return buildGuardAbortResult(page, ctx, spec, postBtn.guard, diagnostics);
+    }
     if (!postBtn.ready) {
+      diagnostics.keepTabOpen = true;
       const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'post_btn_disabled', diagnostics);
       return buildResult({
         platform: spec.id,
@@ -562,12 +572,13 @@ export async function publishVideo(page, ctx) {
       });
     }
 
+    await humanPause(page, 1200, 2400);
     reportProgress(ctx, spec.id, 'publish', '正在提交发布 X 推文');
     await page.clickAny([postBtn.selector, ...POST_BUTTON_SELECTORS], { timeoutMs: 5000 });
     diagnostics.steps.push({ step: 'click_post', selector: postBtn.selector });
 
     const publishTimeoutMs = ctx.options?.publishTimeoutMs ?? 20_000;
-    const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1000;
+    const pollIntervalMs = ctx.options?.pollIntervalMs ?? 1200;
     const deadline = Date.now() + publishTimeoutMs;
     let publishedConfirmed = false;
     let statusUrl = null;
@@ -576,23 +587,15 @@ export async function publishVideo(page, ctx) {
     let iter = 0;
     while (iter === 0 || Date.now() < deadline) {
       iter += 1;
-      await page.sleep(pollIntervalMs);
+      await page.sleep(jitteredInterval(pollIntervalMs));
       finalUrl = (await page.url()) || '';
-      const afterText = await readPageText(page);
-      const afterVerify = detectVerificationPrompt(afterText);
 
-      if (isXChallengeUrl(finalUrl) || afterVerify.detected) {
-        const screenshotPath = await captureScreenshot(page, ctx.screenshotDir, spec.id, 'verification', diagnostics);
-        return buildResult({
-          platform: spec.id,
-          status: 'needs_verification',
-          url: finalUrl,
-          screenshotPath,
-          message: `点击发布后 X 触发安全验证（${afterVerify.kind || 'challenge'}），请在浏览器中完成验证`,
-          diagnostics: { ...diagnostics, verification: afterVerify },
-        });
+      const postGuard = await checkXGuard(page, { stage: 'post_submit', inFlow: true });
+      if (postGuard.blocked) {
+        return buildGuardAbortResult(page, ctx, spec, postGuard, diagnostics);
       }
 
+      const afterText = await readPageText(page);
       const extractedUrl = await extractPublishedStatusUrl(page);
       if (extractedUrl) {
         statusUrl = extractedUrl;
@@ -627,6 +630,7 @@ export async function publishVideo(page, ctx) {
     );
 
     if (!publishedConfirmed) {
+      diagnostics.keepTabOpen = true;
       return buildResult({
         platform: spec.id,
         status: 'failed',

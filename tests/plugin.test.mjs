@@ -1,3 +1,6 @@
+// Enable fast-mode timings strictly inside the automated test suite.
+process.env.SOCIAL_PUB_FAST_HUMAN = '1';
+
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -8,16 +11,30 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import {
+  DEVICE_BOUND_COOKIE_PLATFORMS,
   PLUGIN_NAME,
   PLUGIN_VERSION,
   clampWaitSeconds,
   redactSensitiveText,
 } from '../src/constants.mjs';
 import {
+  buildBezierPath,
+  buildTypingPlan,
+  buildWheelChunks,
+  isFastHumanMode,
+  jitterDelay,
+  randInt,
+  sampleInteriorPoint,
+} from '../src/human.mjs';
+import {
+  CdpPage,
   IN_PAGE_FINDER_SOURCE,
+  WEBDRIVER_STEALTH_SCRIPT,
+  buildLaunchArgs,
   discoverCdpCandidates,
   parseCookieFile,
 } from '../src/cdp.mjs';
+import { shouldKeepTabOpen } from '../src/job-runner.mjs';
 import { probeMediaFile } from '../src/media-probe.mjs';
 import { LocalStorage } from '../src/storage.mjs';
 import { TOOLS, createPublisherService } from '../src/server.mjs';
@@ -27,6 +44,10 @@ import {
   listPlatformSpecs,
   resolvePlatformId,
 } from '../src/adapters/index.mjs';
+import {
+  checkPageGuardState,
+  readGuardPageText,
+} from '../src/adapters/base.mjs';
 import { computeXWeightedLength } from '../src/adapters/x.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -101,16 +122,20 @@ function createMockPage(config = {}) {
       if (src.includes('iframe[name="videoUpload"]')) {
         return config.iframeSrc || null;
       }
-      // 5. clickWithTextFallback text matcher
-      if (src.includes('data-svp-click')) {
+      // 5. Read-only clickWithTextFallback text matcher (zero data-svp-click DOM mutation!)
+      if (src.includes('INTERACTIVE_SELECTOR') && src.includes('FALLBACK_SELECTOR')) {
         const labels = Array.isArray(args[0]) ? args[0] : [];
         const matched = labels.find((l) => (config.clickableTextLabels || []).includes(l));
         if (matched) {
-          state.calls.push({ method: 'clickText', label: matched });
+          state.calls.push({ method: 'findTextRect', label: matched });
           if (typeof config.onClickText === 'function') {
             config.onClickText(state, matched);
           }
-          return matched;
+          return {
+            found: true,
+            text: matched,
+            rect: { x: 420, y: 360, left: 420, top: 360, width: 120, height: 40 },
+          };
         }
         return null;
       }
@@ -154,6 +179,20 @@ function createMockPage(config = {}) {
         config.onClick(state, hit);
       }
       return { selector: hit };
+    },
+    async clickPoint(rect) {
+      state.calls.push({ method: 'clickPoint', rect });
+      return { x: Math.round((rect?.left ?? rect?.x ?? 0) + (rect?.width ?? 10) / 2), y: Math.round((rect?.top ?? rect?.y ?? 0) + (rect?.height ?? 10) / 2) };
+    },
+    async hoverAny(selectors, opts) {
+      const list = Array.isArray(selectors) ? selectors : [selectors];
+      const hit = matchesAny(list, state.visibleSelectors);
+      state.calls.push({ method: 'hoverAny', selectors: list, found: Boolean(hit), opts });
+      return hit ? { found: true, selector: hit, x: 480, y: 320 } : { found: false, selector: null };
+    },
+    async idleDrift(opts) {
+      state.calls.push({ method: 'idleDrift', opts });
+      return { x: 450, y: 280, steps: opts?.steps ?? 1 };
     },
     async fillText(selectors, text, opts) {
       const list = Array.isArray(selectors) ? selectors : [selectors];
@@ -226,7 +265,7 @@ test('manifests, skill and .mcp.json pass TapCanvas inspectPlugin, probeMcp and 
   const info = inspectPlugin(PLUGIN_ROOT, { requireFormats: ['claude', 'codex'] });
   assert.deepEqual(info.problems, []);
   assert.equal(info.name, 'social-video-publisher');
-  assert.equal(info.version, '0.1.0');
+  assert.equal(info.version, '0.2.0');
   assert.equal(info.logoUrl, codexManifest.interface.logo);
   assert.equal(info.skills.length, 1);
   assert.equal(info.skills[0].name, 'social-video-publish');
@@ -267,7 +306,7 @@ test('manifests, skill and .mcp.json pass TapCanvas inspectPlugin, probeMcp and 
 
   const claudeTurn = manager.forTurn('claude');
   assert.equal(claudeTurn.plugins.length, 1);
-  assert.deepEqual(claudeTurn.names, ['social-video-publisher@0.1.0']);
+  assert.deepEqual(claudeTurn.names, ['social-video-publisher@0.2.0']);
 
   const codexTurn = manager.forTurn('codex');
   assert.ok(codexTurn.mcpServers.social_pub);
@@ -1021,8 +1060,10 @@ test('multi-platform sequential PublishJobRunner end-to-end: draft, dedupe detec
   assert.equal(draftJobRes.job.results.length, 4);
   assert.ok(draftJobRes.job.results.every((r) => r.status === 'draft_saved'));
 
-  // Cookie was injected into XHS page, NEVER leaked into persisted storage files
-  assert.equal(openedPages[0].state.cookies.length, 2);
+  // Device-bound cookieFiles for XHS MUST be blocked by default, and NEVER leaked into storage files
+  assert.equal(openedPages[0].state.cookies.length, 0, 'XHS cross-profile cookieFiles must be refused by default');
+  assert.equal(draftJobRes.job.results[0].cookieInjectionBlocked, true);
+  assert.equal(draftJobRes.job.results[0].diagnostics.cookieInjectionBlocked, true);
   const rawHistory = fs.readFileSync(path.join(dataDir, 'history.jsonl'), 'utf8');
   assert.doesNotMatch(rawHistory, /SUPER_SECRET_COOKIE_VAL|ANOTHER_SECRET/);
 
@@ -1061,4 +1102,747 @@ test('multi-platform sequential PublishJobRunner end-to-end: draft, dedupe detec
   assert.equal(historyRes.count, 8);
   const xOnly = await service.callTool('list_publish_history', { platform: 'twitter', limit: 20 });
   assert.equal(xOnly.count, 2);
+});
+
+function createSeededRng(seed = 42) {
+  let state = seed >>> 0;
+  return () => {
+    state = (1664525 * state + 1013904223) >>> 0;
+    return state / 0x100000000;
+  };
+}
+
+test('human.mjs kinematics: interior point bounds, Bezier path, ASCII+CJK typing plan, wheel chunks & jitter', () => {
+  assert.equal(isFastHumanMode(), true);
+  assert.equal(isFastHumanMode({ fastMode: true }), true);
+
+  const rng = createSeededRng(20261126);
+
+  // 1. sampleInteriorPoint: 200 samples strictly within [22%, 78%] and never exact geometric center
+  const rect = { left: 100, top: 200, width: 200, height: 100 };
+  const rectAlt = { x: 100, y: 200, width: 200, height: 100 };
+  let exactCenterHits = 0;
+  for (let i = 0; i < 200; i += 1) {
+    const pt = sampleInteriorPoint(i % 2 === 0 ? rect : rectAlt, { rng });
+    assert.ok(pt.x >= 100 + 200 * 0.22 && pt.x <= 100 + 200 * 0.78, `x out of [22%, 78%]: ${pt.x}`);
+    assert.ok(pt.y >= 200 + 100 * 0.22 && pt.y <= 200 + 100 * 0.78, `y out of [22%, 78%]: ${pt.y}`);
+    if (pt.x === 200 && pt.y === 250) exactCenterHits += 1;
+  }
+  assert.equal(exactCenterHits, 0, 'sampleInteriorPoint must avoid exact geometric center');
+
+  // 2. buildBezierPath: smooth Fitts-scaled curve with 8-22ms cadence, non-collinear arc & exact endpoint
+  const pathLong = buildBezierPath({ x: 120, y: 150 }, { x: 860, y: 620 }, { rng: createSeededRng(7), overshootChance: 1 });
+  assert.ok(pathLong.length >= 15 && pathLong.length <= 54, `unexpected path length: ${pathLong.length}`);
+  assert.deepEqual(
+    { x: pathLong[pathLong.length - 1].x, y: pathLong[pathLong.length - 1].y },
+    { x: 860, y: 620 },
+  );
+  let maxPerpDev = 0;
+  const lineDx = 860 - 120;
+  const lineDy = 620 - 150;
+  const lineLen = Math.hypot(lineDx, lineDy);
+  for (const pt of pathLong) {
+    assert.ok(pt.delayMs >= 8 && pt.delayMs <= 22, `step delayMs out of [8,22]: ${pt.delayMs}`);
+    const perp = Math.abs((pt.x - 120) * lineDy - (pt.y - 150) * lineDx) / lineLen;
+    if (perp > maxPerpDev) maxPerpDev = perp;
+  }
+  assert.ok(maxPerpDev > 5, `Bezier curve must deviate from straight line, got ${maxPerpDev}`);
+
+  // Short move (<250px) without overshoot
+  const pathShort = buildBezierPath({ x: 300, y: 300 }, { x: 420, y: 340 }, { rng: createSeededRng(9), overshootChance: 0 });
+  assert.ok(pathShort.length >= 12 && pathShort.length <= 48);
+  assert.equal(pathShort[pathShort.length - 1].x, 420);
+  assert.equal(pathShort[pathShort.length - 1].y, 340);
+
+  // 3. buildTypingPlan: mixed ASCII + CJK + punctuation + emoji never dumps a paragraph in one call
+  const longText = 'TapCanvas v0.2.0 发布！这是一段用于验证拟人化输入节奏的中文测试文本，包含标点符号、换行\n以及多句自然停顿。最后加上🚀和 #AI视频 标签！';
+  const plan = buildTypingPlan(longText, { rng: createSeededRng(11) });
+  assert.equal(plan.map((s) => s.text).join(''), longText, 'reconstructed text must match input exactly');
+  const keySteps = plan.filter((s) => s.kind === 'key');
+  const imeSteps = plan.filter((s) => s.kind === 'ime');
+  assert.ok(keySteps.length >= 15, 'ASCII characters must emit per-char key steps');
+  assert.ok(imeSteps.length >= 10, 'CJK/emoji text must split into small 1-4 char IME chunks');
+  for (const k of keySteps) {
+    assert.equal(Array.from(k.text).length, 1);
+    assert.ok(k.holdMs >= 35 && k.holdMs <= 95, `key holdMs out of range: ${k.holdMs}`);
+    assert.ok((k.delayMs >= 50 && k.delayMs <= 155) || (k.delayMs >= 220 && k.delayMs <= 480));
+  }
+  for (const ime of imeSteps) {
+    const len = Array.from(ime.text).length;
+    assert.ok(len >= 1 && len <= 4, `IME chunk too large (${len}): ${ime.text}`);
+    assert.ok(ime.preDelayMs >= 120 && ime.preDelayMs <= 290);
+    assert.ok((ime.delayMs >= 60 && ime.delayMs <= 160) || (ime.delayMs >= 300 && ime.delayMs <= 680));
+  }
+
+  // 3b. buildTypingPlan normalizes CRLF and bare CR to single LF (no '\r' step or double newline)
+  const crlfPlan = buildTypingPlan('a\r\nb\rc', { rng: createSeededRng(12) });
+  assert.equal(crlfPlan.map((s) => s.text).join(''), 'a\nb\nc');
+  assert.equal(crlfPlan.some((s) => s.text === '\r'), false, 'must normalize \\r\\n and \\r to \\n');
+
+  // 4. buildWheelChunks: 3-8 chunks summing exactly to deltaY, 45-120ms cadence
+  for (const delta of [680, -940, 180]) {
+    const chunks = buildWheelChunks(delta, { rng: createSeededRng(13) });
+    assert.ok(chunks.length >= 3 && chunks.length <= 8, `chunk count out of [3,8]: ${chunks.length}`);
+    assert.equal(chunks.reduce((sum, c) => sum + c.deltaY, 0), delta);
+    for (const c of chunks) {
+      assert.equal(Math.sign(c.deltaY), Math.sign(delta));
+      assert.ok(c.delayMs >= 45 && c.delayMs <= 120);
+    }
+  }
+  // Tiny deltas 1..4 (positive & negative) MUST NEVER reverse sign!
+  for (const tiny of [1, -1, 2, -2, 3, -3, 4, -4]) {
+    const chunks = buildWheelChunks(tiny, { rng: createSeededRng(14) });
+    assert.ok(chunks.length >= 1);
+    assert.equal(chunks.reduce((sum, c) => sum + c.deltaY, 0), tiny);
+    for (const c of chunks) {
+      assert.equal(Math.sign(c.deltaY), Math.sign(tiny), `sign reversal on tiny delta=${tiny}: ${JSON.stringify(chunks)}`);
+    }
+  }
+
+  // 5. jitterDelay & randInt
+  for (let i = 0; i < 50; i += 1) {
+    const j = jitterDelay(1000, 0.25, rng);
+    assert.ok(j >= 750 && j <= 1250);
+    const r = randInt(5, 10, rng);
+    assert.ok(r >= 5 && r <= 10 && Number.isInteger(r));
+  }
+});
+
+test('CdpPage humanized physics, stealth launch flags, prototype-only webdriver cleanup, and zero window.__svLastFileSelector leak', async (t) => {
+  const { videoPath } = createTempMedia(t);
+
+  // 1. Launch flags: keep AutomationControlled, remove --disable-infobars, use 1440,900
+  const launchArgs = buildLaunchArgs({ profileDir: '/tmp/fake-profile' });
+  assert.ok(launchArgs.includes('--disable-blink-features=AutomationControlled'));
+  assert.ok(launchArgs.includes('--window-size=1440,900'));
+  assert.equal(launchArgs.includes('--disable-infobars'), false, 'deprecated --disable-infobars must be removed');
+
+  // 2. WEBDRIVER_STEALTH_SCRIPT: only patches Navigator.prototype when webdriver === true (no own property on navigator!)
+  {
+    const FakeNavProto = {};
+    Object.defineProperty(FakeNavProto, 'webdriver', { get: () => true, configurable: true });
+    const fakeNav = Object.create(FakeNavProto);
+    new Function('navigator', WEBDRIVER_STEALTH_SCRIPT)(fakeNav);
+    assert.equal(fakeNav.webdriver, undefined);
+    assert.equal(Object.getOwnPropertyDescriptor(fakeNav, 'webdriver'), undefined, 'must NOT create own property on navigator');
+  }
+  {
+    const FakeNavProto = {};
+    Object.defineProperty(FakeNavProto, 'webdriver', { get: () => false, configurable: true });
+    const fakeNav = Object.create(FakeNavProto);
+    new Function('navigator', WEBDRIVER_STEALTH_SCRIPT)(fakeNav);
+    assert.equal(fakeNav.webdriver, false, 'must not touch navigator when webdriver is already false');
+  }
+
+  // 3. CdpPage CDP command trace: Bezier mouseMoved, clickPoint bringToFront + press/release, setFiles without window leak or DOM.getDocument flood
+  const cdpCalls = [];
+  let setFilesProbeCount = 0;
+  const fakeClient = {
+    on: () => () => {},
+    async send(method, params = {}) {
+      cdpCalls.push({ method, params });
+      if (method === 'Runtime.evaluate') {
+        const expr = String(params.expression || '');
+        // Assert zero window.__svLastFileSelector leak anywhere!
+        assert.equal(expr.includes('__svLastFileSelector'), false, 'must never reference window.__svLastFileSelector');
+        assert.equal(expr.includes('data-svp-click'), false, 'cdp.mjs must never inject data-svp-click');
+        if (expr.includes('window.innerWidth')) {
+          return { result: { value: { width: 1440, height: 900, scrollY: 0 } } };
+        }
+        if (expr.includes('hit ? { found: true, selector: hit.selector }')) {
+          setFilesProbeCount += 1;
+          // First probe misses (verifies DOM.getDocument is NOT called on miss), second succeeds
+          return {
+            result: {
+              value: setFilesProbeCount >= 2
+                ? { found: true, selector: 'input[type="file"]' }
+                : { found: false, selector: null },
+            },
+          };
+        }
+        if (params.returnByValue === false) {
+          return { result: { objectId: 'obj-file-1' } };
+        }
+        if (expr.includes('getBoundingClientRect')) {
+          return {
+            result: {
+              value: {
+                selector: '.upload-zone',
+                visible: true,
+                disabled: false,
+                left: 400,
+                top: 300,
+                x: 400,
+                y: 300,
+                width: 240,
+                height: 120,
+                tagName: 'div',
+                isContentEditable: false,
+              },
+            },
+          };
+        }
+        return { result: { value: false } };
+      }
+      if (method === 'DOM.requestNode') return { nodeId: 77 };
+      return {};
+    },
+  };
+
+  const page = new CdpPage(fakeClient, {
+    sessionId: 'sess-1',
+    targetId: 'target-1',
+    fastMode: true,
+    rng: createSeededRng(101),
+  });
+
+  // clickPoint dispatches bringToFront + multi-step Bezier mouseMoved + pressed(buttons=1) + released(buttons=0)
+  const clickedPt = await page.clickPoint({ left: 500, top: 320, width: 160, height: 50 });
+  assert.ok(clickedPt.x >= 500 + 160 * 0.22 && clickedPt.x <= 500 + 160 * 0.78);
+  assert.ok(clickedPt.y >= 320 + 50 * 0.22 && clickedPt.y <= 320 + 50 * 0.78);
+  assert.ok(cdpCalls.some((c) => c.method === 'Page.bringToFront'));
+  const moves = cdpCalls.filter((c) => c.method === 'Input.dispatchMouseEvent' && c.params.type === 'mouseMoved');
+  assert.ok(moves.length >= 12, `expected multi-step Bezier moves, got ${moves.length}`);
+  assert.ok(moves.every((m) => m.params.pointerType === 'mouse'));
+  const pressed = cdpCalls.find((c) => c.method === 'Input.dispatchMouseEvent' && c.params.type === 'mousePressed');
+  const released = cdpCalls.find((c) => c.method === 'Input.dispatchMouseEvent' && c.params.type === 'mouseReleased');
+  assert.equal(pressed.params.buttons, 1);
+  assert.equal(released.params.buttons, 0);
+  assert.equal(page.cursorX, clickedPt.x);
+  assert.equal(page.cursorY, clickedPt.y);
+
+  // hoverAny & idleDrift work smoothly
+  const hovered = await page.hoverAny(['.upload-zone']);
+  assert.equal(hovered.found, true);
+  assert.equal(hovered.selector, '.upload-zone');
+  const drift = await page.idleDrift({ steps: 2 });
+  assert.equal(drift.steps, 2);
+
+  // setFiles calls DOM.getDocument ONLY ONCE when file input is found (not during miss tick)
+  const docCallsBefore = cdpCalls.filter((c) => c.method === 'DOM.getDocument').length;
+  const setRes = await page.setFiles(['input[type="file"]'], videoPath);
+  assert.equal(setRes.selector, 'input[type="file"]');
+  const docCallsAfter = cdpCalls.filter((c) => c.method === 'DOM.getDocument').length;
+  assert.equal(docCallsAfter - docCallsBefore, 1, 'DOM.getDocument must only run once when file input is ready');
+  assert.ok(cdpCalls.some((c) => c.method === 'DOM.setFileInputFiles' && c.params.nodeId === 77));
+
+  // fillText types ASCII via keyDown/keyUp (no unconditional char) and CJK via small-chunk Input.insertText;
+  // on darwin, clear uses commands: ['selectAll']
+  const cdpBeforeType = cdpCalls.length;
+  await page.fillText(['.upload-zone'], 'Hi世界和平测试！', { clear: true });
+  const typeCalls = cdpCalls.slice(cdpBeforeType);
+  const rawKeyDowns = typeCalls.filter((c) => c.method === 'Input.dispatchKeyEvent' && c.params.type === 'rawKeyDown');
+  const textKeyDowns = typeCalls.filter((c) => c.method === 'Input.dispatchKeyEvent' && c.params.type === 'keyDown');
+  const charEvents = typeCalls.filter((c) => c.method === 'Input.dispatchKeyEvent' && c.params.type === 'char');
+  const inserts = typeCalls.filter((c) => c.method === 'Input.insertText');
+  assert.equal(charEvents.length, 0, 'must not emit unconditional char events that bypass keydown preventDefault()');
+  assert.ok(rawKeyDowns.length >= 2, 'must emit selectAll and Backspace rawKeyDown');
+  if (process.platform === 'darwin') {
+    assert.deepEqual(rawKeyDowns[0].params.commands, ['selectAll'], 'darwin clear must pass commands: ["selectAll"]');
+  }
+  assert.ok(textKeyDowns.length >= 2, 'ASCII characters must emit per-char keyDown events');
+  assert.ok(inserts.length >= 2, 'CJK string must be chunked across multiple small Input.insertText calls');
+  assert.equal(inserts.map((i) => i.params.text).join(''), '世界和平测试！');
+
+  // clickPoint rejects invalid / zero-size rects explicitly
+  await assert.rejects(() => page.clickPoint(null), /无效或零尺寸矩形/);
+  await assert.rejects(() => page.clickPoint({ left: 10, top: 20, width: 0, height: 40 }), /无效或零尺寸矩形/);
+  await assert.rejects(() => page.clickPoint({ x: 10, y: 20, width: 100, height: 0 }), /无效或零尺寸矩形/);
+
+  // Newline handling: contenteditable uses Shift+Enter; single-line <input> replaces \n with space;
+  // typeTag on contenteditable uses moveToEndOfDocument on darwin
+  let evalTargetMode = 'contenteditable';
+  const richCalls = [];
+  const richClient = {
+    on: () => () => {},
+    async send(method, params = {}) {
+      richCalls.push({ method, params });
+      if (method === 'Runtime.evaluate') {
+        const expr = String(params.expression || '');
+        if (expr.includes('window.innerWidth')) return { result: { value: { width: 1440, height: 900, scrollY: 0 } } };
+        if (expr.includes('getBoundingClientRect')) {
+          return {
+            result: {
+              value: {
+                selector: '.editor',
+                visible: true,
+                disabled: false,
+                left: 300,
+                top: 250,
+                x: 300,
+                y: 250,
+                width: 300,
+                height: 80,
+                tagName: evalTargetMode === 'input' ? 'input' : 'div',
+                isContentEditable: evalTargetMode === 'contenteditable',
+              },
+            },
+          };
+        }
+        if (expr.includes('document.activeElement')) {
+          return {
+            result: {
+              value: {
+                tagName: evalTargetMode === 'input' ? 'input' : 'div',
+                isContentEditable: evalTargetMode === 'contenteditable',
+              },
+            },
+          };
+        }
+        if (expr.includes('hit.el.isContentEditable')) {
+          return { result: { value: evalTargetMode === 'contenteditable' } };
+        }
+        return { result: { value: null } };
+      }
+      return {};
+    },
+  };
+  const richPage = new CdpPage(richClient, { sessionId: 's2', targetId: 't2', fastMode: true, rng: createSeededRng(202) });
+
+  // 1) contenteditable newline -> Shift+Enter (modifiers: 8, type: 'keyDown')
+  evalTargetMode = 'contenteditable';
+  await richPage.fillText(['.editor'], 'L1\r\nL2', { clear: false });
+  const ceEnter = richCalls.filter((c) => c.method === 'Input.dispatchKeyEvent' && c.params.key === 'Enter' && c.params.type === 'keyDown');
+  assert.equal(ceEnter.length, 1, 'CRLF must emit exactly one newline Enter');
+  assert.equal(ceEnter[0].params.modifiers, 8, 'contenteditable newline must use Shift+Enter (modifiers=8)');
+
+  // 2) typeTag on contenteditable moves caret to end via moveToEndOfDocument on darwin (or Ctrl+End)
+  const beforeTagIdx = richCalls.length;
+  await richPage.typeTag(['.editor'], 'AI', { commitKey: 'Enter' });
+  const tagCalls = richCalls.slice(beforeTagIdx);
+  if (process.platform === 'darwin') {
+    const moveEnd = tagCalls.find((c) => c.method === 'Input.dispatchKeyEvent' && Array.isArray(c.params.commands) && c.params.commands.includes('moveToEndOfDocument'));
+    assert.ok(moveEnd, 'darwin typeTag must move caret with commands: ["moveToEndOfDocument"]');
+  }
+
+  // 3) single-line <input> replaces newlines with spaces so it never submits the <form>
+  evalTargetMode = 'input';
+  const beforeInputIdx = richCalls.length;
+  await richPage.fillText(['.editor'], 'Title1\nTitle2', { clear: false });
+  const inputCalls = richCalls.slice(beforeInputIdx);
+  const inputEnters = inputCalls.filter((c) => c.method === 'Input.dispatchKeyEvent' && c.params.key === 'Enter');
+  assert.equal(inputEnters.length, 0, 'single-line <input> must never emit Enter for newlines');
+});
+
+test('device-bound cookieFiles refusal by default (Douyin/XHS/X), allowUnsafeCookieInjection opt-in, no overwrite when logged in, and shouldKeepTabOpen', async (t) => {
+  const { tmpDir, videoPath } = createTempMedia(t);
+  const dataDir = path.join(tmpDir, 'data');
+
+  const dyCookie = path.join(tmpDir, 'dy.cookie');
+  const xhsCookie = path.join(tmpDir, 'xhs.cookie');
+  const xCookie = path.join(tmpDir, 'x.cookie');
+  const biliCookie = path.join(tmpDir, 'bili.cookie');
+  fs.writeFileSync(dyCookie, 'sessionid=dy_secret; bd_ticket_guard_client_data=guard_secret\n', { mode: 0o600 });
+  fs.writeFileSync(xhsCookie, 'web_session=xhs_secret\n', { mode: 0o600 });
+  fs.writeFileSync(xCookie, 'auth_token=x_secret; cf_clearance=cf_secret\n', { mode: 0o600 });
+  fs.writeFileSync(biliCookie, 'SESSDATA=bili_secret\n', { mode: 0o600 });
+
+  assert.ok(DEVICE_BOUND_COOKIE_PLATFORMS.has('douyin'));
+  assert.ok(DEVICE_BOUND_COOKIE_PLATFORMS.has('xiaohongshu'));
+  assert.ok(DEVICE_BOUND_COOKIE_PLATFORMS.has('x'));
+  assert.equal(DEVICE_BOUND_COOKIE_PLATFORMS.has('bilibili'), false);
+
+  // 1. shouldKeepTabOpen covers form_populated, composer_populated, keepTabOpen, needs_verification, needs_login
+  assert.equal(shouldKeepTabOpen('xiaohongshu', { status: 'draft_saved', diagnostics: { draftMethod: 'form_populated' } }), true);
+  assert.equal(shouldKeepTabOpen('douyin', { status: 'draft_saved', diagnostics: { draftMethod: 'composer_populated' } }), true);
+  assert.equal(shouldKeepTabOpen('douyin', { status: 'draft_saved', diagnostics: { keepTabOpen: true } }), true);
+  assert.equal(shouldKeepTabOpen('douyin', { status: 'needs_verification', diagnostics: {} }), true);
+  assert.equal(shouldKeepTabOpen('douyin', { status: 'needs_login', diagnostics: {} }), true);
+  assert.equal(shouldKeepTabOpen('bilibili', { status: 'draft_saved', diagnostics: { draftMethod: 'form_populated' } }), true);
+  assert.equal(shouldKeepTabOpen('douyin', { status: 'published', diagnostics: {} }), false);
+
+  // 2. check_accounts with cookieFiles on NOT-logged-in persistent profile
+  const createdPages = [];
+  const makeSessionFactory = ({ loggedInPlatforms = [] } = {}) => async () => ({
+    source: 'mock_cdp',
+    profileDir: path.join(tmpDir, 'profile'),
+    async newPage() {
+      const page = createMockPage({
+        onNavigate: (st, url) => {
+          const isLoggedIn = (
+            (url.includes('douyin') && loggedInPlatforms.includes('douyin')) ||
+            (url.includes('xiaohongshu') && loggedInPlatforms.includes('xiaohongshu')) ||
+            (url.includes('x.com') && loggedInPlatforms.includes('x')) ||
+            (url.includes('bilibili') && loggedInPlatforms.includes('bilibili')) ||
+            st.cookies.length > 0
+          );
+          if (isLoggedIn) {
+            st.currentUrl = url;
+            st.visibleSelectors = new Set([
+              'input[type="file"][accept*="video"]',
+              'input.upload-input',
+              '[data-testid="tweetTextarea_0"]',
+              '.bcc-upload-wrapper input[type="file"]',
+            ]);
+          } else if (url.includes('douyin')) {
+            st.currentUrl = 'https://creator.douyin.com/';
+            st.visibleSelectors = new Set(['.login-guide-btn']);
+          } else if (url.includes('xiaohongshu')) {
+            st.currentUrl = 'https://creator.xiaohongshu.com/login';
+            st.visibleSelectors = new Set(['.login-container']);
+          } else if (url.includes('x.com')) {
+            st.currentUrl = 'https://x.com/i/flow/login';
+            st.visibleSelectors = new Set(['input[autocomplete="username"]']);
+          } else if (url.includes('bilibili')) {
+            st.currentUrl = 'https://passport.bilibili.com/login';
+            st.visibleSelectors = new Set(['.login-scan-wp']);
+          }
+        },
+      });
+      createdPages.push(page);
+      return page;
+    },
+    keepTargetOpen() {},
+    async close() {},
+  });
+
+  // Default: refuses Douyin, XHS, X; allows Bilibili when not yet logged in
+  const svc1 = createPublisherService({
+    dataDir,
+    sessionFactory: makeSessionFactory({ loggedInPlatforms: [] }),
+    probeMediaFile: (file, opts) => probeMediaFile(file, { ...opts, skipFfprobe: true }),
+  });
+  const checkDefault = await svc1.callTool('check_accounts', {
+    platforms: ['douyin', 'xiaohongshu', 'x', 'bilibili'],
+    cookieFiles: { douyin: dyCookie, xiaohongshu: xhsCookie, x: xCookie, bilibili: biliCookie },
+  });
+  assert.equal(checkDefault.ok, true);
+  const byPlat = Object.fromEntries(checkDefault.accounts.map((a) => [a.platform, a]));
+  for (const blockedPlat of ['douyin', 'xiaohongshu', 'x']) {
+    assert.equal(byPlat[blockedPlat].loggedIn, false, `${blockedPlat} must not inject cookieFiles by default`);
+    assert.equal(byPlat[blockedPlat].status, 'needs_login');
+    assert.equal(byPlat[blockedPlat].cookieInjectionBlocked, true);
+    assert.match(byPlat[blockedPlat].message, /open_login/);
+  }
+  assert.equal(byPlat.bilibili.loggedIn, true, 'non-device-bound bilibili injects cookie when not logged in');
+
+  // allowUnsafeCookieInjection: true injects when NOT logged in
+  const checkUnsafe = await svc1.callTool('check_accounts', {
+    platforms: ['douyin'],
+    cookieFiles: { douyin: dyCookie },
+    allowUnsafeCookieInjection: true,
+  });
+  assert.equal(checkUnsafe.accounts[0].loggedIn, true);
+  assert.equal(checkUnsafe.accounts[0].cookieInjectionBlocked, undefined);
+
+  // Even with allowUnsafeCookieInjection: true (or on bilibili), NEVER overwrite an already-logged-in persistent profile!
+  createdPages.length = 0;
+  const svcLoggedIn = createPublisherService({
+    dataDir,
+    sessionFactory: makeSessionFactory({ loggedInPlatforms: ['douyin', 'bilibili'] }),
+    probeMediaFile: (file, opts) => probeMediaFile(file, { ...opts, skipFfprobe: true }),
+  });
+  const checkAlreadyLoggedIn = await svcLoggedIn.callTool('check_accounts', {
+    platforms: ['douyin', 'bilibili'],
+    cookieFiles: { douyin: dyCookie, bilibili: biliCookie },
+    allowUnsafeCookieInjection: true,
+  });
+  assert.equal(checkAlreadyLoggedIn.accounts[0].loggedIn, true);
+  assert.equal(checkAlreadyLoggedIn.accounts[0].cookieInjectionSkipped, 'already_logged_in');
+  assert.equal(checkAlreadyLoggedIn.accounts[1].loggedIn, true);
+  assert.equal(checkAlreadyLoggedIn.accounts[1].cookieInjectionSkipped, 'already_logged_in');
+  assert.equal(createdPages[0].state.cookies.length, 0, 'must NEVER re-inject cookies into already logged-in douyin profile');
+  assert.equal(createdPages[1].state.cookies.length, 0, 'must NEVER re-inject cookies into already logged-in bilibili profile');
+
+  // start_publish_job with Douyin cookieFiles (not logged in) refuses cookie injection & keeps login tab open
+  const keptTabs = [];
+  const svcJob = createPublisherService({
+    dataDir,
+    sessionFactory: async () => {
+      const base = await makeSessionFactory({ loggedInPlatforms: [] })();
+      return {
+        ...base,
+        keepTargetOpen(p) { keptTabs.push(p); },
+      };
+    },
+    probeMediaFile: (file, opts) => probeMediaFile(file, { ...opts, skipFfprobe: true }),
+  });
+  const jobRes = await svcJob.callTool('start_publish_job', {
+    videoPath,
+    title: '抖音风控回归测试',
+    platforms: ['douyin'],
+    mode: 'draft',
+    cookieFiles: { douyin: dyCookie },
+    waitSeconds: 5,
+  });
+  assert.equal(jobRes.ok, true);
+  assert.equal(jobRes.job.results[0].status, 'needs_login');
+  assert.equal(jobRes.job.results[0].cookieInjectionBlocked, true);
+  assert.match(jobRes.job.results[0].message, /open_login/);
+  assert.equal(keptTabs.length, 1, 'needs_login tab must be kept open');
+});
+
+test('static stealth audit: zero data-svp-click DOM mutation and zero window.__svLastFileSelector leak across src/', () => {
+  const srcRoot = path.join(PLUGIN_ROOT, 'src');
+  const walk = (dir) => {
+    const out = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...walk(full));
+      else if (entry.isFile() && entry.name.endsWith('.mjs')) out.push(full);
+    }
+    return out;
+  };
+  const files = walk(srcRoot);
+  assert.ok(files.length >= 9);
+  for (const file of files) {
+    const content = fs.readFileSync(file, 'utf8');
+    assert.equal(content.includes('data-svp-click'), false, `Found forbidden data-svp-click in ${file}`);
+    assert.equal(content.includes('__svLastFileSelector'), false, `Found forbidden __svLastFileSelector in ${file}`);
+    assert.equal(content.includes('--disable-infobars'), false, `Found deprecated --disable-infobars in ${file}`);
+  }
+});
+
+test('all 4 adapters: mid-flow forced logout & risk-control immediate abort + warmupUploadPage + form_populated keepTabOpen', async (t) => {
+  const { tmpDir, videoPath } = createTempMedia(t);
+
+  // 1. Douyin: exact incident reproduction — after setFiles, transcode poll sees forced kickout to /creator-micro/home
+  {
+    const dyAdapter = getAdapter('douyin');
+    const dyKickPage = createMockPage({
+      visibleSelectors: ['input[type="file"][accept*="video"]', '.upload-btn'],
+      onSetFiles: (st) => {
+        st.currentUrl = 'https://creator.douyin.com/creator-micro/home';
+        st.pageText = '扫码登录 验证码登录';
+      },
+    });
+    const res = await dyAdapter.publishVideo(dyKickPage, {
+      videoPath,
+      title: '抖音中途登出回归',
+      mode: 'draft',
+      screenshotDir: tmpDir,
+      options: { pollIntervalMs: 1, uploadTimeoutMs: 5000 },
+    });
+    assert.equal(res.status, 'needs_login');
+    assert.equal(res.diagnostics.keepTabOpen, true);
+    assert.equal(res.diagnostics.riskReason, 'session_invalidated_mid_flow');
+    assert.equal(res.diagnostics.uploadIterations, 1, 'must abort immediately on first poll tick without retrying');
+    assert.ok(fs.existsSync(res.screenshotPath));
+    // Verify warmupUploadPage ran idleDrift + hoverAny BEFORE setFiles!
+    const driftIdx = dyKickPage.state.calls.findIndex((c) => c.method === 'idleDrift');
+    const setFilesIdx = dyKickPage.state.calls.findIndex((c) => c.method === 'setFiles');
+    assert.ok(driftIdx >= 0 && driftIdx < setFilesIdx, 'warmupUploadPage must run idleDrift before setFiles');
+    // Must NEVER attempt fillText after kickout!
+    assert.equal(dyKickPage.state.calls.some((c) => c.method === 'fillText'), false);
+  }
+
+  // 1b. Douyin risk-control banner mid-flow
+  {
+    const dyAdapter = getAdapter('douyin');
+    const dyRiskPage = createMockPage({
+      visibleSelectors: ['input[type="file"][accept*="video"]'],
+      onSetFiles: (st) => {
+        st.pageText = '操作过于频繁，账号存在异常，请稍后再试';
+      },
+    });
+    const res = await dyAdapter.publishVideo(dyRiskPage, {
+      videoPath,
+      title: '抖音风控弹窗回归',
+      mode: 'draft',
+      screenshotDir: tmpDir,
+      options: { pollIntervalMs: 1, uploadTimeoutMs: 5000 },
+    });
+    assert.equal(res.status, 'needs_verification');
+    assert.equal(res.diagnostics.keepTabOpen, true);
+    assert.equal(res.diagnostics.riskReason, 'risk_control_banner');
+    assert.equal(res.diagnostics.uploadIterations, 1);
+  }
+
+  // 2. Xiaohongshu: mid-flow session expired + form_populated keepTabOpen
+  {
+    const xhsAdapter = getAdapter('xiaohongshu');
+    const xhsKickPage = createMockPage({
+      visibleSelectors: ['input.upload-input'],
+      onSetFiles: (st) => {
+        st.pageText = '登录已过期，请重新登录';
+      },
+    });
+    const kickRes = await xhsAdapter.publishVideo(xhsKickPage, {
+      videoPath,
+      title: '小红书中途过期',
+      mode: 'draft',
+      screenshotDir: tmpDir,
+      options: { pollIntervalMs: 1, uploadTimeoutMs: 5000 },
+    });
+    assert.equal(kickRes.status, 'needs_login');
+    assert.equal(kickRes.diagnostics.keepTabOpen, true);
+    assert.equal(kickRes.diagnostics.riskReason, 'session_invalidated_mid_flow');
+    assert.equal(xhsKickPage.state.calls.some((c) => c.method === 'fillText'), false);
+
+    // XHS draft button missing -> form_populated MUST set keepTabOpen = true
+    const xhsFormOnly = createMockPage({
+      visibleSelectors: ['input.upload-input', 'input[placeholder*="填写标题"]', '.ql-editor', '.reupload-btn'],
+    });
+    const formRes = await xhsAdapter.publishVideo(xhsFormOnly, {
+      videoPath,
+      title: '小红书预填保活',
+      description: '正文内容',
+      mode: 'draft',
+      screenshotDir: tmpDir,
+      options: { pollIntervalMs: 1 },
+    });
+    assert.equal(formRes.status, 'draft_saved');
+    assert.equal(formRes.diagnostics.draftMethod, 'form_populated');
+    assert.equal(formRes.diagnostics.keepTabOpen, true);
+    assert.equal(shouldKeepTabOpen('xiaohongshu', formRes), true);
+  }
+
+  // 3. X (Twitter): mid-flow Arkose/challenge abort during media attachment wait
+  {
+    const xAdapter = getAdapter('x');
+    const xRiskPage = createMockPage({
+      visibleSelectors: ['input[data-testid="fileInput"]', '[data-testid="tweetTextarea_0"]'],
+      onSetFiles: (st) => {
+        st.currentUrl = 'https://x.com/account/access';
+        st.pageText = 'Verify you are human';
+      },
+    });
+    const res = await xAdapter.publishVideo(xRiskPage, {
+      videoPath,
+      description: 'X challenge mid-flow',
+      mode: 'draft',
+      screenshotDir: tmpDir,
+      options: { pollIntervalMs: 1, uploadTimeoutMs: 5000 },
+    });
+    assert.equal(res.status, 'needs_verification');
+    assert.equal(res.diagnostics.keepTabOpen, true);
+    assert.equal(xRiskPage.state.calls.some((c) => c.method === 'fillText'), false);
+  }
+
+  // 4. Bilibili: mid-flow forced logout & geetest risk abort during upload wait
+  {
+    const biliAdapter = getAdapter('bilibili');
+    const biliKickPage = createMockPage({
+      visibleSelectors: ['.bcc-upload-wrapper input[type="file"]'],
+      onSetFiles: (st) => {
+        st.currentUrl = 'https://passport.bilibili.com/login';
+        st.visibleSelectors.add('.login-scan-wp');
+      },
+    });
+    const kickRes = await biliAdapter.publishVideo(biliKickPage, {
+      videoPath,
+      title: 'B站中途登出',
+      tags: ['AI'],
+      mode: 'draft',
+      screenshotDir: tmpDir,
+      options: { pollIntervalMs: 1, uploadTimeoutMs: 5000 },
+    });
+    assert.equal(kickRes.status, 'needs_login');
+    assert.equal(kickRes.diagnostics.keepTabOpen, true);
+    assert.equal(kickRes.diagnostics.riskReason, 'session_invalidated_mid_flow');
+    assert.equal(biliKickPage.state.calls.some((c) => c.method === 'fillText'), false);
+
+    const biliRiskPage = createMockPage({
+      visibleSelectors: ['.bcc-upload-wrapper input[type="file"]'],
+      onSetFiles: (st) => {
+        st.visibleSelectors.add('.geetest_panel');
+        st.pageText = '请完成安全验证';
+      },
+    });
+    const riskRes = await biliAdapter.publishVideo(biliRiskPage, {
+      videoPath,
+      title: 'B站中途滑块风控',
+      tags: ['AI'],
+      mode: 'draft',
+      screenshotDir: tmpDir,
+      options: { pollIntervalMs: 1, uploadTimeoutMs: 5000 },
+    });
+    assert.equal(riskRes.status, 'needs_verification');
+    assert.equal(riskRes.diagnostics.keepTabOpen, true);
+  }
+});
+
+test('guard false-positive regression: Douyin normal safety widget text and user-typed/X-timeline text never trigger false abort', async () => {
+  // (a) Douyin normal logged-in editor page containing "作品安全检测" / "内容安全检测" must NOT abort
+  const normalDouyinPage = createMockPage({
+    initialUrl: 'https://creator.douyin.com/creator-micro/content/post/video?enter_from=publish_page',
+    initialText: '发布视频 作品标题 作品安全检测：未见异常 内容安全检测已开启 重新上传 发布',
+    visibleSelectors: ['input[placeholder*="填写作品标题"]', '.zone-container'],
+  });
+  const normalGuard = await checkPageGuardState(normalDouyinPage, {
+    platformName: '抖音',
+    stage: 'pre_submit',
+    inFlow: true,
+    isLoginUrl: (u) => /creator\.douyin\.com\/?$|\/creator-micro\/home/i.test(u),
+    loginSelectors: ['.login-guide-btn'],
+  });
+  assert.equal(normalGuard.blocked, false, `Normal Douyin editor page must not false-abort: ${JSON.stringify(normalGuard)}`);
+
+  // (b) readGuardPageText + checkPageGuardState with createTreeWalker skips [contenteditable="true"]
+  //     and article[data-testid="tweet"], while STILL catching real outside-editor risk modals!
+  function createTreeWalkerMockPage({ url, nodes }) {
+    const fakeDocument = {
+      body: { innerText: nodes.map((n) => n.text).join('\n') },
+      createTreeWalker(_root, _whatToShow, filter) {
+        let idx = 0;
+        return {
+          nextNode() {
+            while (idx < nodes.length) {
+              const item = nodes[idx++];
+              const parentEl = {
+                tagName: item.tag || 'DIV',
+                isContentEditable: Boolean(item.contentEditable),
+                parentElement: item.parentEl || null,
+                getAttribute: (name) => (item.attrs && name in item.attrs ? item.attrs[name] : null),
+              };
+              const textNode = { nodeValue: item.text, parentElement: parentEl, parentNode: parentEl };
+              const verdict = filter && typeof filter.acceptNode === 'function' ? filter.acceptNode(textNode) : 1;
+              if (verdict === 1) return textNode;
+            }
+            return null;
+          },
+        };
+      },
+    };
+    return {
+      async url() { return url; },
+      async queryAny() { return { selector: null, found: false, visible: false, text: '', disabled: false }; },
+      async evaluate(fn, ...args) {
+        const runner = new Function('document', 'NodeFilter', 'args', `return (${fn.toString()})(...args);`);
+        return runner(fakeDocument, { SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_SKIP: 3 }, args);
+      },
+    };
+  }
+
+  const tweetParent = {
+    tagName: 'ARTICLE',
+    isContentEditable: false,
+    parentElement: null,
+    getAttribute: (name) => (name === 'data-testid' ? 'tweet' : null),
+  };
+
+  // User-typed copy in contenteditable & background X timeline tweet mentioning风控/captcha/Verify you are human/验证码
+  const safeTreePage = createTreeWalkerMockPage({
+    url: 'https://x.com/compose/post',
+    nodes: [
+      { tag: 'DIV', text: 'Post composer ready' },
+      { tag: 'DIV', contentEditable: true, attrs: { contenteditable: 'true' }, text: '分享如何避免触发风控、请完成安全验证、Verify you are human、请输入验证码、captcha' },
+      { tag: 'SPAN', parentEl: tweetParent, text: 'Background timeline tweet: Verify you are human! 触发风控 扫码登录 请完成安全验证' },
+    ],
+  });
+
+  const guardText = await readGuardPageText(safeTreePage);
+  assert.equal(guardText, 'Post composer ready');
+  const safeCheck = await checkPageGuardState(safeTreePage, {
+    platformName: 'X',
+    stage: 'pre_submit',
+    inFlow: true,
+  });
+  assert.equal(safeCheck.blocked, false, 'Text inside contenteditable or background tweet article must not trigger guard');
+
+  // Genuine outside-editor verification modal MUST still be caught!
+  const realModalPage = createTreeWalkerMockPage({
+    url: 'https://creator.douyin.com/creator-micro/content/post/video',
+    nodes: [
+      { tag: 'DIV', contentEditable: true, attrs: { contenteditable: 'true' }, text: '正常视频简介' },
+      { tag: 'DIV', text: '请完成安全验证，请输入短信验证码' },
+    ],
+  });
+  const modalCheck = await checkPageGuardState(realModalPage, {
+    platformName: '抖音',
+    stage: 'post_submit',
+    inFlow: true,
+  });
+  assert.equal(modalCheck.blocked, true);
+  assert.equal(modalCheck.status, 'needs_verification');
 });

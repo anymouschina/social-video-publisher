@@ -1,6 +1,6 @@
 {
   "name": "social-video-publisher",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "一条视频多平台适配并发布或存草稿至小红书、抖音、推特（X）与 B 站；基于本机真实 Chrome CDP，零第三方依赖，默认存草稿且公开发布前强制人工确认。",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
