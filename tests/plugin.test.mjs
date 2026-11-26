@@ -2588,6 +2588,14 @@ test('regressions (#62): newPage(about:blank) skips sync, sole-tab close spawns 
         throw err;
       }
       syncSeq += 1;
+      // Simulate Xiaohongshu SPA document swap mid-observation on first sync for XHS
+      if (tab.url.includes('xiaohongshu') && !tab.docChangedOnce) {
+        tab.docChangedOnce = true;
+        const err = new Error('Document changed during observation; observe again');
+        err.code = 1;
+        err.stdout = JSON.stringify({ error: 'Document changed during observation; observe again' });
+        throw err;
+      }
       return { stdout: JSON.stringify({ context_id: `c${syncSeq}`, observation_id: `o${syncSeq}`, tab_id: Number(id) }), stderr: '' };
     }
     if (cmd === 'navigate') {

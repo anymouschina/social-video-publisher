@@ -42,7 +42,14 @@ const RESYNC_REASONS = Object.freeze(new Set([
   'cooperation_sync_required',
   'control_context_invalid',
   'observation_required',
+  'document_changed',
 ]));
+
+function isDocumentChangedError(err) {
+  if (!err) return false;
+  if (err.reason === 'document_changed') return true;
+  return /document changed during observation|observe again/i.test(String(err.message || ''));
+}
 
 const KEY_NAME_MAP = Object.freeze({
   ' ': 'Space',
@@ -646,7 +653,7 @@ export class BskPage {
   }
 
   async _sync() {
-    let settlingRetried = false;
+    let transientRetries = 0;
     while (true) {
       try {
         const res = await this._run(
@@ -660,9 +667,10 @@ export class BskPage {
         this.observationUsed = false;
         return res;
       } catch (err) {
-        if (err?.reason === 'operation_settling' && !settlingRetried) {
-          settlingRetried = true;
-          const waitMs = Math.min(5_000, Math.max(100, Number(err?.retryAfterMs) || 400));
+        const isTransient = err?.reason === 'operation_settling' || isDocumentChangedError(err);
+        if (isTransient && transientRetries < 3) {
+          transientRetries += 1;
+          const waitMs = Math.min(5_000, Math.max(150, Number(err?.retryAfterMs) || 450));
           await this._humanSleep(waitMs);
           continue;
         }
@@ -703,11 +711,14 @@ export class BskPage {
           await this._humanSleep(waitMs);
           continue;
         }
-        if (RESYNC_REASONS.has(reason) && resyncRetries < 1) {
+        if ((RESYNC_REASONS.has(reason) || isDocumentChangedError(err)) && resyncRetries < 2) {
           resyncRetries += 1;
           this.contextId = null;
           this.observationId = null;
           this.observationUsed = true;
+          if (isDocumentChangedError(err)) {
+            await this._humanSleep(450);
+          }
           await this._sync();
           continue;
         }
